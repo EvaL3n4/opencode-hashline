@@ -3,6 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { readFileSync, realpathSync, writeFileSync, existsSync } from "fs";
 import { createHash } from "crypto";
 import * as path from "path";
+import { createTwoFilesPatch, structuredPatch, applyPatch } from "diff";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -28,6 +29,7 @@ interface FileDiffMetadata {
   file: string;
   before: string;
   after: string;
+  patch: string;
   additions: number;
   deletions: number;
 }
@@ -38,6 +40,34 @@ type EditContext = {
 };
 
 type ToolResult = { output: string; metadata?: { [key: string]: any }; title?: string };
+// ─── Normalization (BOM + Line Endings) ──────────────────────────────────────
+
+type LineEnding = "\r\n" | "\n";
+
+function detectLineEnding(content: string): LineEnding {
+  const crlfIdx = content.indexOf("\r\n");
+  const lfIdx = content.indexOf("\n");
+  if (lfIdx === -1) return "\n";
+  if (crlfIdx === -1) return "\n";
+  return crlfIdx < lfIdx ? "\r\n" : "\n";
+}
+
+function normalizeToLF(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
+
+function restoreLineEndings(text: string, ending: LineEnding): string {
+  return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
+}
+
+function stripBom(content: string): { bom: string; text: string } {
+  return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
+}
+
+function normalizeForStorage(text: string): string {
+  const { text: noBom } = stripBom(text);
+  return normalizeToLF(noBom);
+}
 
 // ─── Hash Computation ────────────────────────────────────────────────────────
 
@@ -45,11 +75,13 @@ const HASH_MASK = 0xffff;
 const HASH_LENGTH = 4;
 
 function normalizeFileText(text: string): string {
-  return text.replace(/[ \t\r]+(?=\n|$)/g, "");
+  return text.replace(/[ \t]+(?=\n|$)/g, "");
 }
 
 function computeFileHash(text: string): string {
-  const normalized = normalizeFileText(text);
+  const { text: noBom } = stripBom(text);
+  const lf = normalizeToLF(noBom);
+  const normalized = normalizeFileText(lf);
   const hash = createHash("md5").update(normalized).digest();
   const low16 = hash.readUInt16LE(0) & HASH_MASK;
   return low16.toString(16).padStart(HASH_LENGTH, "0").toUpperCase();
@@ -66,8 +98,9 @@ class SnapshotStore {
   private totalBytes = 0;
 
   record(path: string, text: string): string {
-    const hash = computeFileHash(text);
-    const snapshot: Snapshot = { path, text, hash, recordedAt: Date.now() };
+    const normalized = normalizeForStorage(text);
+    const hash = computeFileHash(normalized);
+    const snapshot: Snapshot = { path, text: normalized, hash, recordedAt: Date.now() };
 
     let versions = this.store.get(path);
     if (!versions) {
@@ -372,6 +405,492 @@ function lineDiff(oldText: string, newText: string): { additions: number; deleti
   return { additions, deletions };
 }
 
+// ─── Boundary Repair ─────────────────────────────────────────────────────────
+
+const STRUCTURAL_CLOSER_RE = /^\s*[)\]}]+[;,]?\s*$/;
+const JSX_CLOSER_RE = /^\s*(?:<\/>|<\/[A-Za-z][\w.:-]*>|\/>)\s*[;,]?\s*$/;
+
+function isStructuralCloserLine(text: string): boolean {
+  return STRUCTURAL_CLOSER_RE.test(text) || JSX_CLOSER_RE.test(text);
+}
+
+interface DelimiterBalance { paren: number; bracket: number; brace: number; }
+
+function computeDelimiterBalance(lines: readonly string[]): DelimiterBalance {
+  const balance: DelimiterBalance = { paren: 0, bracket: 0, brace: 0 };
+  let inBlockComment = false;
+  let quote = "";
+  for (const line of lines) {
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inBlockComment) {
+        if (ch === "*" && line[i + 1] === "/") { inBlockComment = false; i++; }
+        continue;
+      }
+      if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = "";
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") { quote = ch; continue; }
+      if (ch === "/" && line[i + 1] === "/") break;
+      if (ch === "/" && line[i + 1] === "*") { inBlockComment = true; i++; continue; }
+      switch (ch) {
+        case "(": balance.paren++; break;
+        case ")": balance.paren--; break;
+        case "[": balance.bracket++; break;
+        case "]": balance.bracket--; break;
+        case "{": balance.brace++; break;
+        case "}": balance.brace--; break;
+      }
+    }
+    if (quote === '"' || quote === "'") quote = "";
+  }
+  return balance;
+}
+
+function balanceDelta(a: DelimiterBalance, b: DelimiterBalance): DelimiterBalance {
+  return { paren: a.paren - b.paren, bracket: a.bracket - b.bracket, brace: a.brace - b.brace };
+}
+function balanceNegate(a: DelimiterBalance): DelimiterBalance {
+  return { paren: -a.paren, bracket: -a.bracket, brace: -a.brace };
+}
+function balanceEqual(a: DelimiterBalance, b: DelimiterBalance): boolean {
+  return a.paren === b.paren && a.bracket === b.bracket && a.brace === b.brace;
+}
+function balanceIsZero(a: DelimiterBalance): boolean {
+  return a.paren === 0 && a.bracket === 0 && a.brace === 0;
+}
+
+function hasNonWhitespace(text: string | undefined): boolean {
+  if (!text) return false;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code !== 9 && code !== 10 && code !== 11 && code !== 12 && code !== 13 && code !== 32) return true;
+  }
+  return false;
+}
+
+function leadingIndent(line: string): string {
+  let end = 0;
+  while (end < line.length) {
+    const code = line.charCodeAt(end);
+    if (code !== 9 && code !== 32) break;
+    end++;
+  }
+  return line.slice(0, end);
+}
+
+function isIndentDeeper(deeper: string, shallower: string): boolean {
+  return deeper.length > shallower.length && deeper.startsWith(shallower);
+}
+
+function countDuplicateLeadingBoundaryLines(payload: readonly string[], startLine: number, fileLines: readonly string[]): number {
+  const max = Math.min(payload.length, startLine - 1);
+  for (let count = max; count >= 1; count--) {
+    let matches = true;
+    let hasContent = false;
+    for (let offset = 0; offset < count; offset++) {
+      const line = payload[offset];
+      if (line !== fileLines[startLine - 1 - count + offset]) { matches = false; break; }
+      hasContent ||= hasNonWhitespace(line);
+    }
+    if (matches && hasContent) return count;
+  }
+  return 0;
+}
+
+function countDuplicateTrailingBoundaryLines(payload: readonly string[], endLine: number, fileLines: readonly string[]): number {
+  const max = Math.min(payload.length, fileLines.length - endLine);
+  for (let count = max; count >= 1; count--) {
+    let matches = true;
+    let hasContent = false;
+    for (let offset = 0; offset < count; offset++) {
+      const line = payload[payload.length - count + offset];
+      if (line !== fileLines[endLine + offset]) { matches = false; break; }
+      hasContent ||= hasNonWhitespace(line);
+    }
+    if (matches && hasContent) return count;
+  }
+  return 0;
+}
+
+interface BoundaryEcho { leading: number; trailing: number; }
+
+function findBoundaryEcho(payload: readonly string[], startLine: number, endLine: number, fileLines: readonly string[]): BoundaryEcho | undefined {
+  const leadingMax = countDuplicateLeadingBoundaryLines(payload, startLine, fileLines);
+  if (leadingMax === 0) return undefined;
+  const trailingMax = countDuplicateTrailingBoundaryLines(payload, endLine, fileLines);
+  if (trailingMax === 0) return undefined;
+  if (leadingMax + trailingMax >= payload.length) return undefined;
+  const leadingBalance = computeDelimiterBalance(payload.slice(0, leadingMax));
+  const trailingBalance = computeDelimiterBalance(payload.slice(payload.length - trailingMax));
+  const droppedBalance = balanceDelta(leadingBalance, balanceNegate(trailingBalance));
+  if (!balanceIsZero(droppedBalance)) {
+    const delta = balanceDelta(
+      computeDelimiterBalance(payload),
+      computeDelimiterBalance(fileLines.slice(startLine - 1, endLine)),
+    );
+    if (!balanceEqual(droppedBalance, delta)) return undefined;
+  }
+  return { leading: leadingMax, trailing: trailingMax };
+}
+
+function findDuplicateSuffix(payload: readonly string[], endLine: number, fileLines: readonly string[], delta: DelimiterBalance): number {
+  if (balanceIsZero(delta)) return 0;
+  const maxK = Math.min(payload.length, fileLines.length - endLine);
+  for (let k = maxK; k >= 1; k--) {
+    let matches = true;
+    for (let t = 0; t < k; t++) {
+      if (payload[payload.length - k + t] !== fileLines[endLine + t]) { matches = false; break; }
+    }
+    if (!matches) continue;
+    if (balanceEqual(computeDelimiterBalance(payload.slice(payload.length - k)), delta)) return k;
+  }
+  return 0;
+}
+
+function findDuplicatePrefix(payload: readonly string[], startLine: number, fileLines: readonly string[], delta: DelimiterBalance): number {
+  if (balanceIsZero(delta)) return 0;
+  const maxJ = Math.min(payload.length, startLine - 1);
+  for (let j = maxJ; j >= 1; j--) {
+    let matches = true;
+    for (let t = 0; t < j; t++) {
+      if (payload[t] !== fileLines[startLine - 1 - j + t]) { matches = false; break; }
+    }
+    if (!matches) continue;
+    if (balanceEqual(computeDelimiterBalance(payload.slice(0, j)), delta)) return j;
+  }
+  return 0;
+}
+
+function findOneSidedBoundaryEcho(payload: readonly string[], startLine: number, endLine: number, fileLines: readonly string[]): { side: "leading" | "trailing"; count: number } | undefined {
+  const leading = countDuplicateLeadingBoundaryLines(payload, startLine, fileLines);
+  const trailing = countDuplicateTrailingBoundaryLines(payload, endLine, fileLines);
+  if (leading > 0 === trailing > 0) return undefined;
+  const side = leading > 0 ? "leading" : "trailing";
+  const count = leading > 0 ? leading : trailing;
+  if (count >= payload.length) return undefined;
+  const echoLines = side === "leading" ? payload.slice(0, count) : payload.slice(payload.length - count);
+  if (!balanceIsZero(computeDelimiterBalance(echoLines))) return undefined;
+  if (endLine === startLine) {
+    if (side !== "trailing" || !echoLines.every(isStructuralCloserLine)) return undefined;
+  }
+  return { side, count };
+}
+
+function bodyTargetIndent(rows: readonly string[]): string | undefined {
+  const nonBlank = rows.filter(hasNonWhitespace);
+  if (nonBlank.length === 0) return undefined;
+  if (nonBlank.every(row => STRUCTURAL_CLOSER_RE.test(row))) return undefined;
+  let target = leadingIndent(nonBlank[0] ?? "");
+  for (const row of nonBlank) {
+    const indent = leadingIndent(row);
+    if (indent.startsWith(target)) continue;
+    if (target.startsWith(indent)) target = indent;
+    else return undefined;
+  }
+  return target;
+}
+
+function resolveShiftedLanding(
+  anchor: number,
+  target: string,
+  fileLines: readonly string[],
+  targetedLines: ReadonlySet<number>,
+): { line: number; crossed: number } | undefined {
+  const anchorText = fileLines[anchor - 1];
+  if (anchorText === undefined || !hasNonWhitespace(anchorText)) return undefined;
+  if (!isIndentDeeper(leadingIndent(anchorText), target)) return undefined;
+  let landing = anchor;
+  let crossed = 0;
+  for (let line = anchor + 1; line <= fileLines.length; line++) {
+    const text = fileLines[line - 1] ?? "";
+    if (!hasNonWhitespace(text)) continue;
+    if (!STRUCTURAL_CLOSER_RE.test(text)) break;
+    const indent = leadingIndent(text);
+    if (!indent.startsWith(target)) break;
+    if (targetedLines.has(line)) return undefined;
+    landing = line;
+    crossed++;
+    if (indent.length === target.length) break;
+  }
+  return landing === anchor ? undefined : { line: landing, crossed };
+}
+
+function repairEdits(edits: readonly EditOp[], fileLines: readonly string[]): { edits: EditOp[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const repaired: EditOp[] = [];
+
+  const targetedLines = new Set<number>();
+  for (const edit of edits) {
+    if (edit.kind === "delete") {
+      for (let l = edit.start; l <= edit.end; l++) targetedLines.add(l);
+    } else if (edit.kind === "swap") {
+      for (let l = edit.start; l <= edit.end; l++) targetedLines.add(l);
+    } else if (edit.position === "before" || edit.position === "after") {
+      targetedLines.add(edit.anchor);
+    }
+  }
+
+  for (const edit of edits) {
+    if (edit.kind === "swap") {
+      const { lines: payload, start, end } = edit;
+
+      const echo = findBoundaryEcho(payload, start, end, fileLines);
+      if (echo) {
+        warnings.push(
+          `Auto-repaired a replacement boundary echo at line ${start}: dropped ${echo.leading} leading and ${echo.trailing} trailing payload line(s) already present outside the range. Issue the payload as the final desired content for the selected range only — never restate unchanged lines bordering the range.`,
+        );
+        repaired.push({ ...edit, lines: payload.slice(echo.leading, payload.length - echo.trailing) });
+        continue;
+      }
+
+      const delta = balanceDelta(
+        computeDelimiterBalance(payload),
+        computeDelimiterBalance(fileLines.slice(start - 1, end)),
+      );
+
+      if (!balanceIsZero(delta)) {
+        const dupSuffix = findDuplicateSuffix(payload, end, fileLines, delta);
+        if (dupSuffix > 0) {
+          warnings.push(
+            `Auto-repaired a delimiter-balance mismatch in the replacement at line ${start}: dropped ${dupSuffix} duplicated trailing payload line(s) already present below the range. Issue the payload as the final desired content only — never restate or omit a closing bracket bordering the range.`,
+          );
+          repaired.push({ ...edit, lines: payload.slice(0, payload.length - dupSuffix) });
+          continue;
+        }
+        const dupPrefix = findDuplicatePrefix(payload, start, fileLines, delta);
+        if (dupPrefix > 0) {
+          warnings.push(
+            `Auto-repaired a delimiter-balance mismatch in the replacement at line ${start}: dropped ${dupPrefix} duplicated leading payload line(s) already present above the range. Issue the payload as the final desired content only — never restate or omit a closing bracket bordering the range.`,
+          );
+          repaired.push({ ...edit, lines: payload.slice(dupPrefix) });
+          continue;
+        }
+      } else {
+        const oneSided = findOneSidedBoundaryEcho(payload, start, end, fileLines);
+        if (oneSided) {
+          const newPayload = oneSided.side === "leading"
+            ? payload.slice(oneSided.count)
+            : payload.slice(0, payload.length - oneSided.count);
+          const where = oneSided.side === "leading" ? "above" : "below";
+          warnings.push(
+            `Auto-repaired a replacement boundary echo at line ${start}: dropped ${oneSided.count} ${oneSided.side} payload line(s) identical to the surviving line(s) just ${where} the range. The range was one line short of the content you retyped — issue the payload as the final content for the selected range only, and widen the range to consume any keeper you restate.`,
+          );
+          repaired.push({ ...edit, lines: newPayload });
+          continue;
+        }
+      }
+
+      repaired.push(edit);
+      continue;
+    }
+
+    if (edit.kind === "insert" && edit.position === "after") {
+      const target = bodyTargetIndent(edit.lines);
+      if (target !== undefined) {
+        const shifted = resolveShiftedLanding(edit.anchor, target, fileLines, targetedLines);
+        if (shifted !== undefined) {
+          warnings.push(
+            `INS.POST ${edit.anchor}: body indented shallower than the anchor, so the landing moved past ${shifted.crossed} closing line${shifted.crossed === 1 ? "" : "s"} to after line ${shifted.line}. For the deeper position inside the block, re-issue with the body indented to match.`,
+          );
+          repaired.push({ ...edit, anchor: shifted.line });
+          continue;
+        }
+      }
+      repaired.push(edit);
+      continue;
+    }
+
+    repaired.push(edit);
+  }
+
+  return { edits: repaired, warnings };
+}
+
+// ─── Recovery (3-way merge + session-chain replay) ──────────────────────────
+
+const RECOVERY_FUZZ_FACTOR = 0;
+
+const RECOVERY_EXTERNAL_WARNING =
+  "Recovered from a stale file hash using a previous read snapshot (file changed externally between read and edit).";
+
+const RECOVERY_SESSION_CHAIN_WARNING =
+  "Recovered from a stale file hash using an earlier in-session snapshot (a prior edit in this session advanced the hash).";
+
+const RECOVERY_SESSION_REPLAY_WARNING =
+  "Recovered by replaying your edits onto the current file content (a prior in-session edit changed the lines you re-targeted with a stale hash). Verify the diff matches your intent.";
+
+const HEADTAIL_DRIFT_WARNING =
+  "Applied the INS.HEAD:/INS.TAIL: edit despite a stale snapshot tag (file changed since your read) — head/tail position is content-independent. Re-read if the drift was unexpected.";
+
+interface RecoveryResult {
+  text: string;
+  firstChangedLine?: number;
+  warnings: string[];
+}
+
+function hasAnchorScopedEdit(edits: readonly EditOp[]): boolean {
+  return edits.some(edit => {
+    if (edit.kind === "delete") return true;
+    if (edit.kind === "swap") return true;
+    return edit.position === "before" || edit.position === "after";
+  });
+}
+
+function collectAnchorLines(edits: readonly EditOp[]): number[] {
+  const lines: number[] = [];
+  for (const edit of edits) {
+    if (edit.kind === "delete") {
+      for (let l = edit.start; l <= edit.end; l++) lines.push(l);
+    } else if (edit.kind === "swap") {
+      for (let l = edit.start; l <= edit.end; l++) lines.push(l);
+    } else if (edit.position === "before" || edit.position === "after") {
+      lines.push(edit.anchor);
+    }
+  }
+  return lines;
+}
+
+function verifyAnchorContent(previousText: string, currentText: string, edits: readonly EditOp[]): boolean {
+  const lines = collectAnchorLines(edits);
+  if (lines.length === 0) return true;
+  const prev = previousText.split("\n");
+  const curr = currentText.split("\n");
+  for (const line of lines) {
+    const idx = line - 1;
+    if (idx < 0 || idx >= prev.length || idx >= curr.length) return false;
+    if (prev[idx] !== curr[idx]) return false;
+  }
+  return true;
+}
+
+function findFirstChangedLine(a: string, b: string): number | undefined {
+  if (a === b) return undefined;
+  const aLines = a.split("\n");
+  const bLines = b.split("\n");
+  const max = Math.max(aLines.length, bLines.length);
+  for (let i = 0; i < max; i++) {
+    if (aLines[i] !== bLines[i]) return i + 1;
+  }
+  return undefined;
+}
+
+function applyEditsToSnapshot(
+  previousText: string,
+  currentText: string,
+  edits: readonly EditOp[],
+  recoveryWarning: string,
+): RecoveryResult | null {
+  const fileLines = previousText.split("\n");
+  const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(edits, fileLines);
+  let applied: string;
+  try {
+    applied = applyEdits(previousText, [...repairedEdits]);
+  } catch {
+    return null;
+  }
+  if (applied === previousText) return null;
+
+  const patch = structuredPatch("file", "file", previousText, applied, "", "", { context: 3 });
+  const merged = applyPatch(currentText, patch, { fuzzFactor: RECOVERY_FUZZ_FACTOR });
+  if (typeof merged !== "string" || merged === currentText) return null;
+
+  const firstChangedLine = findFirstChangedLine(currentText, merged);
+  const warnings = [...repairWarnings];
+  if (firstChangedLine !== undefined) warnings.unshift(recoveryWarning);
+
+  return { text: merged, firstChangedLine, warnings };
+}
+
+function replaySessionChainOnCurrent(
+  previousText: string,
+  currentText: string,
+  edits: readonly EditOp[],
+): RecoveryResult | null {
+  if (previousText.split("\n").length !== currentText.split("\n").length) return null;
+  if (!verifyAnchorContent(previousText, currentText, edits)) return null;
+  const fileLines = currentText.split("\n");
+  const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(edits, fileLines);
+  let applied: string;
+  try {
+    applied = applyEdits(currentText, [...repairedEdits]);
+  } catch {
+    return null;
+  }
+  if (applied === currentText) return null;
+  return {
+    text: applied,
+    firstChangedLine: findFirstChangedLine(currentText, applied),
+    warnings: [RECOVERY_SESSION_REPLAY_WARNING, ...repairWarnings],
+  };
+}
+
+function tryRecover(
+  store: SnapshotStore,
+  args: { path: string; currentText: string; fileHash: string; edits: readonly EditOp[] },
+): RecoveryResult | null {
+  const { path, currentText, fileHash, edits } = args;
+  const snapshot = store.byHash(path, fileHash);
+  if (!snapshot) return null;
+  const head = store.head(path);
+  const isHead = head === snapshot;
+  const recoveryWarning = isHead ? RECOVERY_EXTERNAL_WARNING : RECOVERY_SESSION_CHAIN_WARNING;
+  const merged = applyEditsToSnapshot(snapshot.text, currentText, edits, recoveryWarning);
+  if (merged !== null) return merged;
+  if (!isHead) return replaySessionChainOnCurrent(snapshot.text, currentText, edits);
+  return null;
+}
+
+// ─── Mismatch Error with Anchored Context ───────────────────────────────────
+
+const MISMATCH_CONTEXT = 2;
+
+function formatAnchoredContext(anchorLines: readonly number[], fileLines: readonly string[]): string[] {
+  const displayLines = new Set<number>();
+  for (const line of anchorLines) {
+    if (line < 1 || line > fileLines.length) continue;
+    const lo = Math.max(1, line - MISMATCH_CONTEXT);
+    const hi = Math.min(fileLines.length, line + MISMATCH_CONTEXT);
+    for (let lineNum = lo; lineNum <= hi; lineNum++) displayLines.add(lineNum);
+  }
+  const anchorSet = new Set(anchorLines);
+  const rows: string[] = [];
+  let previous = -1;
+  for (const lineNum of [...displayLines].sort((a, b) => a - b)) {
+    if (previous !== -1 && lineNum > previous + 1) rows.push("...");
+    previous = lineNum;
+    const marker = anchorSet.has(lineNum) ? "*" : " ";
+    rows.push(`${marker}${lineNum}:${fileLines[lineNum - 1] ?? ""}`);
+  }
+  return rows;
+}
+
+interface MismatchDetails {
+  path: string;
+  expectedHash: string;
+  actualHash: string;
+  fileLines: string[];
+  anchorLines: readonly number[];
+  hashRecognized: boolean;
+}
+
+function formatMismatchError(details: MismatchDetails): string {
+  const pathText = ` for ${details.path}`;
+  const header: string[] = details.hashRecognized
+    ? [
+        `Edit rejected${pathText}: file changed between read and edit.`,
+        `Section is bound to #${details.expectedHash}, but the current file hashes to #${details.actualHash}. If a prior edit in this session modified this file, copy the [${details.path}#newhash] header from that edit's response; otherwise re-read the file with \`read\` to refresh the tag before retrying.`,
+      ]
+    : [
+        `Edit rejected${pathText}: hash #${details.expectedHash} is not from this session.`,
+        `The current file hashes to #${details.actualHash}. Re-read the file with \`read\` to copy a current [${details.path}#${details.actualHash}] header — never invent the tag and never reuse one from a prior session.`,
+      ];
+  const context = formatAnchoredContext(details.anchorLines, details.fileLines);
+  if (context.length === 0) return header.join("\n");
+  return [...header, "", ...context].join("\n");
+}
 
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
 
@@ -381,7 +900,7 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
     return { output: "Error: no valid patch sections found. Expected [PATH#TAG] header followed by operations." };
   }
 
-  const prepared: { path: string; newText: string; oldText: string }[] = [];
+  const prepared: { path: string; newText: string; oldText: string; bom: string; lineEnding: LineEnding; warnings: string[] }[] = [];
 
   for (const section of sections) {
     const canonical = canonicalPath(section.path);
@@ -391,48 +910,80 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
     }
 
     const rawContent = readFileSync(section.path, "utf-8");
-    const normalized = rawContent.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const { bom } = stripBom(rawContent);
+    const lineEnding = detectLineEnding(rawContent);
+    const normalized = normalizeForStorage(rawContent);
     const currentHash = computeFileHash(normalized);
 
     if (currentHash !== section.hash) {
       const snapshot = snapshotStore.byHash(canonical, section.hash);
+
+      if (!hasAnchorScopedEdit(section.edits)) {
+        const fileLines = normalized.split("\n");
+        const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(section.edits, fileLines);
+        const newText = applyEdits(normalized, repairedEdits);
+        prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: [HEADTAIL_DRIFT_WARNING, ...repairWarnings] });
+        continue;
+      }
+
       if (snapshot) {
-        return { output: `Error: edit rejected—file changed since last read.\n\nSection is bound to #${section.hash}, but the current file hashes to #${currentHash}.\n\nRe-read the file with \`read\` to get a fresh [${section.path}#${currentHash}] header, then retry your edit.` };
+        const recovered = tryRecover(snapshotStore, {
+          path: canonical,
+          currentText: normalized,
+          fileHash: section.hash,
+          edits: section.edits,
+        });
+        if (recovered) {
+          prepared.push({ path: section.path, newText: recovered.text, oldText: normalized, bom, lineEnding, warnings: recovered.warnings });
+          continue;
+        }
+        const fileLines = normalized.split("\n");
+        const anchorLines = collectAnchorLines(section.edits);
+        return { output: formatMismatchError({ path: section.path, expectedHash: section.hash, actualHash: currentHash, fileLines, anchorLines, hashRecognized: true }) };
       } else {
-        return { output: `Error: edit rejected—hash #${section.hash} is not from this session.\n\nThe current file hashes to #${currentHash}.\n\nRe-read the file with \`read\` to get a fresh [${section.path}#${currentHash}] header—never invent the tag and never reuse one from a prior session.` };
+        const fileLines = normalized.split("\n");
+        const anchorLines = collectAnchorLines(section.edits);
+        return { output: formatMismatchError({ path: section.path, expectedHash: section.hash, actualHash: currentHash, fileLines, anchorLines, hashRecognized: false }) };
       }
     }
 
-    const newText = applyEdits(normalized, section.edits);
-    prepared.push({ path: section.path, newText, oldText: normalized });
+    const fileLines = normalized.split("\n");
+    const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(section.edits, fileLines);
+    const newText = applyEdits(normalized, repairedEdits);
+    prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: repairWarnings });
   }
 
   const results: string[] = [];
   const filediffs: FileDiffMetadata[] = [];
 
   for (const entry of prepared) {
-    writeFileSync(entry.path, entry.newText);
+    const restored = entry.bom + restoreLineEndings(entry.newText, entry.lineEnding);
+    writeFileSync(entry.path, restored);
     const canonical = canonicalPath(entry.path);
     const newHash = snapshotStore.record(canonical, entry.newText);
 
     const { additions, deletions } = lineDiff(entry.oldText, entry.newText);
+    const diffString = createTwoFilesPatch(entry.path, entry.path, entry.oldText, entry.newText);
     filediffs.push({
       file: entry.path,
       before: entry.oldText,
       after: entry.newText,
+      patch: diffString,
       additions,
       deletions,
     });
 
     const changedLines = entry.newText.split("\n");
     const linePreview = changedLines.slice(0, 50).map((line, i) => `${i + 1}:${line}`).join("\n");
-    results.push(`Edited [${entry.path}#${newHash}]\n${linePreview}`);
+    const warningPrefix = entry.warnings.length > 0 ? entry.warnings.map(w => `⚠ ${w}`).join("\n") + "\n" : "";
+    results.push(`${warningPrefix}Edited [${entry.path}#${newHash}]\n${linePreview}`);
   }
 
   if (filediffs.length > 0) {
-    const title = context.worktree ? relativePath(context.worktree, filediffs[0]!.file) : filediffs[0]!.file;
-    context.metadata({ metadata: { filediff: filediffs[0]!, diagnostics: {} } });
-    return { output: results.join("\n\n"), metadata: { filediff: filediffs[0]!, diagnostics: {} }, title };
+    const first = filediffs[0]!;
+    const title = context.worktree ? relativePath(context.worktree, first.file) : first.file;
+    context.metadata({ metadata: { diff: first.patch, filediff: first, diagnostics: {} } });
+    return { output: results.join("\n\n"), metadata: { diff: first.patch, filediff: first, diagnostics: {} }, title };
   }
   return { output: results.join("\n\n") };
 }
@@ -592,5 +1143,24 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
   };
 };
 
+// ─── Test Exports ───────────────────────────────────────────────────────────
+export {
+  type Snapshot, type EditOp, type PatchSection, type LineEnding,
+  type DelimiterBalance, type BoundaryEcho, type RecoveryResult, type MismatchDetails,
+  detectLineEnding, normalizeToLF, restoreLineEndings, stripBom, normalizeForStorage,
+  normalizeFileText, computeFileHash, SnapshotStore, canonicalPath,
+  parsePatch, applyEdits, getAnchorLine, applySingleEdit, lineDiff,
+  isStructuralCloserLine, computeDelimiterBalance, balanceDelta, balanceNegate,
+  balanceEqual, balanceIsZero, hasNonWhitespace, leadingIndent, isIndentDeeper,
+  countDuplicateLeadingBoundaryLines, countDuplicateTrailingBoundaryLines,
+  findBoundaryEcho, findDuplicateSuffix, findDuplicatePrefix,
+  findOneSidedBoundaryEcho, bodyTargetIndent, resolveShiftedLanding, repairEdits,
+  hasAnchorScopedEdit, collectAnchorLines, verifyAnchorContent, findFirstChangedLine,
+  applyEditsToSnapshot, replaySessionChainOnCurrent, tryRecover,
+  formatAnchoredContext, formatMismatchError,
+  HEADTAIL_DRIFT_WARNING, RECOVERY_EXTERNAL_WARNING,
+  RECOVERY_SESSION_CHAIN_WARNING, RECOVERY_SESSION_REPLAY_WARNING,
+  MISMATCH_CONTEXT,
+};
 export default HashlinePlugin;
 export { HashlinePlugin };
