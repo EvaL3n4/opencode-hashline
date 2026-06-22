@@ -31,7 +31,7 @@ git clone https://github.com/EvaL3n4/opencode-hashline.git ~/opencode-hashline
 ln -sf ~/opencode-hashline/src/index.ts ~/.config/opencode/plugins/hashline-edit.ts
 
 # Add dependency to ~/.config/opencode/package.json
-# { "dependencies": { "xxhash-wasm": "^1.1.0" } }
+# No external deps needed—uses node:crypto (built-in)
 ```
 
 ### npm (future)

@@ -27,7 +27,7 @@ All hooks confirmed against `@opencode-ai/plugin` type definitions and DCP plugi
 
 ### Hash & Snapshot System (adapted from oh-my-pi)
 
-- **Algorithm**: xxHash32 via `xxhash-wasm`, masked to 16 bits (`& 0xffff`)
+- **Algorithm**: MD5 via `node:crypto`, first 16 bits of digest (`& 0xffff`)
 - **Format**: 4 uppercase hex chars (e.g., `1A2B`), collision space = 65,536
 - **Input**: Entire normalized file text (trailing `[ \t\r]` stripped per line, LF normalized)
 - **Line numbers NOT part of hash input**, file path NOT part of hash input
@@ -114,7 +114,7 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 
 ### v1 scope (current)
 
-- [ ] Hash computation + normalization (`xxhash-wasm`, 4-hex xxHash32)
+- [ ] Hash computation + normalization (`node:crypto` MD5 → 4-hex, 16-bit)
 - [ ] Snapshot store (Map + LRU, 30 paths × 4 versions, 64 MiB cap)
 - [ ] Read post-processing (header injection via `tool.execute.after`)
 - [ ] Write post-processing (snapshot recording via `tool.execute.after`)
@@ -162,8 +162,9 @@ Managed in `~/.config/opencode/package.json` (OpenCode runs `bun install` at sta
 
 | Package | Purpose |
 |---|---|
-| `xxhash-wasm` | Hash computation (matches oh-my-pi's algorithm) |
-| `@opencode-ai/plugin` | TypeScript types for plugin development |
+| `@opencode-ai/plugin` | TypeScript types for plugin development (already in `~/.config/opencode/package.json`) |
+
+No runtime dependencies—hash uses `node:crypto` (built-in).
 
 ### Testing Approach
 
