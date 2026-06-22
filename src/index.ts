@@ -434,7 +434,7 @@ function isInternalAgent(system: string[]): boolean {
 
 // ─── Plugin Entry Point ──────────────────────────────────────────────────────
 
-export const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
+const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
   return {
     "tool.execute.before": async (input, output) => {
       if (input.tool === "read") {
@@ -507,3 +507,6 @@ export const HashlinePlugin: Plugin = async ({ client, $, directory, worktree })
     },
   };
 };
+
+export default HashlinePlugin;
+export { HashlinePlugin };
