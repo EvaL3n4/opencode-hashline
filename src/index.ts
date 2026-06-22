@@ -25,8 +25,7 @@ interface PatchSection {
 
 // ─── Hash Computation ────────────────────────────────────────────────────────
 
-const HASH_BITS = 16;
-const HASH_MASK = (1 << HASH_BITS) - 1;
+const HASH_MASK = 0xffff;
 const HASH_LENGTH = 4;
 
 function normalizeFileText(text: string): string {
@@ -141,26 +140,11 @@ function canonicalPath(filePath: string): string {
 
 interface CallInfo {
   filePath?: string;
-  content?: string;
+  rawContent?: string;
+  writeContent?: string;
 }
 
 const pendingCalls = new Map<string, CallInfo>();
-
-// ─── Read Post-Processing ────────────────────────────────────────────────────
-
-function processReadOutput(filePath: string, output: string): string {
-  const canonical = canonicalPath(filePath);
-  const hash = snapshotStore.record(canonical, output);
-  return `[${filePath}#${hash}]\n${output}`;
-}
-
-// ─── Write Post-Processing ───────────────────────────────────────────────────
-
-function processWriteOutput(filePath: string, content: string): string {
-  const canonical = canonicalPath(filePath);
-  const hash = snapshotStore.record(canonical, content);
-  return `[${filePath}#${hash}]`;
-}
 
 // ─── Patch Parser ────────────────────────────────────────────────────────────
 
@@ -169,104 +153,93 @@ function parsePatch(input: string): PatchSection[] {
   const lines = input.split("\n");
 
   let currentSection: PatchSection | null = null;
-  let currentOp: { lines: string[] } | null = null;
-  let i = 0;
+  let bodyTarget: string[] | null = null;
 
-  while (i < lines.length) {
-    const line = lines[i]!;
-
-    if (line.startsWith("*** Begin Patch") || line.startsWith("*** End Patch")) {
-      i++;
-      continue;
-    }
+  for (const line of lines) {
+    if (line.startsWith("*** Begin Patch") || line.startsWith("*** End Patch")) continue;
 
     const headerMatch = line.match(/^\[([^\]]+)#([0-9A-Fa-f]{4})\]\s*$/);
     if (headerMatch) {
-      if (currentSection && currentOp) {
-        flushOp(currentSection, currentOp);
-        currentOp = null;
-      }
+      bodyTarget = null;
       if (currentSection) sections.push(currentSection);
       currentSection = {
         path: headerMatch[1]!,
         hash: headerMatch[2]!.toUpperCase(),
         edits: [],
       };
-      i++;
       continue;
     }
 
-    if (!currentSection) {
-      i++;
+    if (!currentSection) continue;
+
+    if (bodyTarget !== null && line.startsWith("+")) {
+      bodyTarget.push(line.slice(1));
       continue;
     }
 
-    const swapMatch = line.match(/^SWAP\s+(\d+)\s*\.?=\s*(\d+):\s*$/);
-    const delMatch = line.match(/^DEL\s+(\d+)\s*(?:\.?=\s*(\d+))?\s*$/);
+    bodyTarget = null;
+
+    const swapMatch = line.match(/^SWAP\s+(\d+)\s*[-.=…]+\s*(\d+):\s*$/);
+    const delMatch = line.match(/^DEL\s+(\d+)\s*(?:[-.=…]+\s*(\d+))?\s*$/);
     const insPreMatch = line.match(/^INS\.PRE\s+(\d+):\s*$/);
     const insPostMatch = line.match(/^INS\.POST\s+(\d+):\s*$/);
     const insHeadMatch = line.match(/^INS\.HEAD:\s*$/);
     const insTailMatch = line.match(/^INS\.TAIL:\s*$/);
 
-    if (swapMatch || delMatch || insPreMatch || insPostMatch || insHeadMatch || insTailMatch) {
-      if (currentOp) flushOp(currentSection, currentOp);
-      currentOp = { lines: [] };
-
-      if (swapMatch) {
-        const start = parseInt(swapMatch[1]!, 10);
-        const end = parseInt(swapMatch[2]!, 10);
-        currentSection.edits.push({ kind: "swap", start, end, lines: [] });
-        currentOp = { lines: [] };
-        const op = currentSection.edits[currentSection.edits.length - 1] as Extract<EditOp, { kind: "swap" }>;
-        currentOp = { lines: op.lines };
-      } else if (delMatch) {
-        const start = parseInt(delMatch[1]!, 10);
-        const end = delMatch[2] ? parseInt(delMatch[2]!, 10) : start;
-        currentSection.edits.push({ kind: "delete", start, end });
-        currentOp = null;
-      } else if (insPreMatch) {
-        const anchor = parseInt(insPreMatch[1]!, 10);
-        currentSection.edits.push({ kind: "insert", position: "before", anchor, lines: [] });
-        const op = currentSection.edits[currentSection.edits.length - 1] as Extract<EditOp, { kind: "insert" }>;
-        currentOp = { lines: op.lines };
-      } else if (insPostMatch) {
-        const anchor = parseInt(insPostMatch[1]!, 10);
-        currentSection.edits.push({ kind: "insert", position: "after", anchor, lines: [] });
-        const op = currentSection.edits[currentSection.edits.length - 1] as Extract<EditOp, { kind: "insert" }>;
-        currentOp = { lines: op.lines };
-      } else if (insHeadMatch) {
-        currentSection.edits.push({ kind: "insert", position: "head", anchor: 0, lines: [] });
-        const op = currentSection.edits[currentSection.edits.length - 1] as Extract<EditOp, { kind: "insert" }>;
-        currentOp = { lines: op.lines };
-      } else if (insTailMatch) {
-        currentSection.edits.push({ kind: "insert", position: "tail", anchor: 0, lines: [] });
-        const op = currentSection.edits[currentSection.edits.length - 1] as Extract<EditOp, { kind: "insert" }>;
-        currentOp = { lines: op.lines };
-      }
-      i++;
-      continue;
+    if (swapMatch) {
+      const edit: Extract<EditOp, { kind: "swap" }> = {
+        kind: "swap",
+        start: parseInt(swapMatch[1]!, 10),
+        end: parseInt(swapMatch[2]!, 10),
+        lines: [],
+      };
+      currentSection.edits.push(edit);
+      bodyTarget = edit.lines;
+    } else if (delMatch) {
+      const start = parseInt(delMatch[1]!, 10);
+      const end = delMatch[2] ? parseInt(delMatch[2]!, 10) : start;
+      currentSection.edits.push({ kind: "delete", start, end });
+    } else if (insPreMatch) {
+      const edit: Extract<EditOp, { kind: "insert" }> = {
+        kind: "insert",
+        position: "before",
+        anchor: parseInt(insPreMatch[1]!, 10),
+        lines: [],
+      };
+      currentSection.edits.push(edit);
+      bodyTarget = edit.lines;
+    } else if (insPostMatch) {
+      const edit: Extract<EditOp, { kind: "insert" }> = {
+        kind: "insert",
+        position: "after",
+        anchor: parseInt(insPostMatch[1]!, 10),
+        lines: [],
+      };
+      currentSection.edits.push(edit);
+      bodyTarget = edit.lines;
+    } else if (insHeadMatch) {
+      const edit: Extract<EditOp, { kind: "insert" }> = {
+        kind: "insert",
+        position: "head",
+        anchor: 0,
+        lines: [],
+      };
+      currentSection.edits.push(edit);
+      bodyTarget = edit.lines;
+    } else if (insTailMatch) {
+      const edit: Extract<EditOp, { kind: "insert" }> = {
+        kind: "insert",
+        position: "tail",
+        anchor: 0,
+        lines: [],
+      };
+      currentSection.edits.push(edit);
+      bodyTarget = edit.lines;
     }
-
-    if (currentOp && line.startsWith("+")) {
-      currentOp.lines.push(line.slice(1));
-      i++;
-      continue;
-    }
-
-    i++;
   }
 
-  if (currentSection && currentOp) {
-    flushOp(currentSection, currentOp);
-  }
   if (currentSection) sections.push(currentSection);
-
   return sections;
-}
-
-function flushOp(section: PatchSection, op: { lines: string[] }): void {
-  // Lines already pushed to the op's lines array via reference
-  // This is a no-op placeholder for the pattern
 }
 
 // ─── Edit Application ────────────────────────────────────────────────────────
@@ -332,14 +305,14 @@ function applySingleEdit(lines: string[], edit: EditOp): string[] {
 
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
 
-async function executeHashlineEdit(args: { input: string }, context: { sessionID: string }): Promise<string> {
+async function executeHashlineEdit(args: { input: string }): Promise<string> {
   const sections = parsePatch(args.input);
 
   if (sections.length === 0) {
     return "Error: no valid patch sections found. Expected [PATH#TAG] header followed by operations.";
   }
 
-  const prepared: { path: string; newText: string; hash: string }[] = [];
+  const prepared: { path: string; newText: string }[] = [];
 
   for (const section of sections) {
     const canonical = canonicalPath(section.path);
@@ -362,7 +335,7 @@ async function executeHashlineEdit(args: { input: string }, context: { sessionID
     }
 
     const newText = applyEdits(normalized, section.edits);
-    prepared.push({ path: section.path, newText, hash: "" });
+    prepared.push({ path: section.path, newText });
   }
 
   const results: string[] = [];
@@ -371,7 +344,6 @@ async function executeHashlineEdit(args: { input: string }, context: { sessionID
     writeFileSync(entry.path, entry.newText);
     const canonical = canonicalPath(entry.path);
     const newHash = snapshotStore.record(canonical, entry.newText);
-    entry.hash = newHash;
 
     const changedLines = entry.newText.split("\n");
     const linePreview = changedLines.slice(0, 50).map((line, i) => `${i + 1}:${line}`).join("\n");
@@ -465,10 +437,25 @@ function isInternalAgent(system: string[]): boolean {
 export const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
   return {
     "tool.execute.before": async (input, output) => {
-      if (input.tool === "read" || input.tool === "write") {
+      if (input.tool === "read") {
         const filePath = output.args?.filePath;
         if (filePath) {
-          pendingCalls.set(input.callID, { filePath });
+          const callInfo: CallInfo = { filePath };
+          try {
+            callInfo.rawContent = readFileSync(filePath, "utf-8");
+          } catch {}
+          pendingCalls.set(input.callID, callInfo);
+        }
+      }
+
+      if (input.tool === "write") {
+        const filePath = output.args?.filePath;
+        if (filePath) {
+          const callInfo: CallInfo = {
+            filePath,
+            writeContent: output.args?.content ?? "",
+          };
+          pendingCalls.set(input.callID, callInfo);
         }
       }
     },
@@ -478,18 +465,21 @@ export const HashlinePlugin: Plugin = async ({ client, $, directory, worktree })
 
       if (input.tool === "read" && callInfo?.filePath) {
         pendingCalls.delete(input.callID);
-        const processed = processReadOutput(callInfo.filePath, output.output);
-        output.output = processed;
+        const canonical = canonicalPath(callInfo.filePath);
+        const rawContent = callInfo.rawContent ?? "";
+        const hash = snapshotStore.record(canonical, rawContent);
+        output.output = `[${callInfo.filePath}#${hash}]\n${output.output}`;
       }
 
       if (input.tool === "write" && callInfo?.filePath) {
         pendingCalls.delete(input.callID);
-        const content = output.args?.content ?? "";
-        const header = processWriteOutput(callInfo.filePath, content);
+        const canonical = canonicalPath(callInfo.filePath);
+        const content = callInfo.writeContent ?? "";
+        const hash = snapshotStore.record(canonical, content);
         if (output.output) {
-          output.output = `${header}\n${output.output}`;
+          output.output = `[${callInfo.filePath}#${hash}]\n${output.output}`;
         } else {
-          output.output = header;
+          output.output = `[${callInfo.filePath}#${hash}]`;
         }
       }
     },
@@ -510,8 +500,8 @@ export const HashlinePlugin: Plugin = async ({ client, $, directory, worktree })
         args: {
           input: tool.schema.string().describe("Hashline patch content. Each section: [PATH#TAG] header, then operations with +body rows."),
         },
-        async execute(args, context) {
-          return executeHashlineEdit(args, { sessionID: context.sessionID });
+        async execute(args) {
+          return executeHashlineEdit(args);
         },
       }),
     },
