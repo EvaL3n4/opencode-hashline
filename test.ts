@@ -471,6 +471,80 @@ if (plusEdit?.kind === "insert") {
   assertEq(plusEdit.lines[1], "++y", "+++y → ++y (literal ++)");
 }
 
+// ─── lineDiff tests ──────────────────────────────────────────────────────────
+
+function lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
+  const a = oldText === "" ? [] : oldText.split("\n");
+  const b = newText === "" ? [] : newText.split("\n");
+  const m = a.length;
+  const n = b.length;
+
+  let prefix = 0;
+  while (prefix < m && prefix < n && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < m - prefix && suffix < n - prefix && a[m - 1 - suffix] === b[n - 1 - suffix]) suffix++;
+
+  const aMid = a.slice(prefix, m - suffix);
+  const bMid = b.slice(prefix, n - suffix);
+
+  if (aMid.length === 0) return { additions: bMid.length, deletions: 0 };
+  if (bMid.length === 0) return { additions: 0, deletions: aMid.length };
+
+  const dp: number[][] = Array.from({ length: aMid.length + 1 }, () => new Array(bMid.length + 1).fill(0));
+  for (let i = 1; i <= aMid.length; i++) {
+    for (let j = 1; j <= bMid.length; j++) {
+      dp[i]![j] = aMid[i - 1] === bMid[j - 1] ? dp[i - 1]![j - 1]! + 1 : Math.max(dp[i - 1]![j]!, dp[i]![j - 1]!);
+    }
+  }
+
+  let additions = 0;
+  let deletions = 0;
+  let i = aMid.length;
+  let j = bMid.length;
+  while (i > 0 && j > 0) {
+    if (aMid[i - 1] === bMid[j - 1]) {
+      i--;
+      j--;
+    } else if (dp[i - 1]![j]! >= dp[i]![j - 1]!) {
+      deletions++;
+      i--;
+    } else {
+      additions++;
+      j--;
+    }
+  }
+  while (i > 0) { deletions++; i--; }
+  while (j > 0) { additions++; j--; }
+
+  return { additions, deletions };
+}
+
+{
+  const r = lineDiff("a\nb\nc", "a\nb\nc");
+  assertEq(r.additions, 0, "lineDiff: identical → 0 additions");
+  assertEq(r.deletions, 0, "lineDiff: identical → 0 deletions");
+
+  const r2 = lineDiff("a\nb\nc", "a\nX\nc");
+  assertEq(r2.additions, 1, "lineDiff: swap middle → 1 addition");
+  assertEq(r2.deletions, 1, "lineDiff: swap middle → 1 deletion");
+
+  const r3 = lineDiff("a\nb", "a\nb\nc\nd");
+  assertEq(r3.additions, 2, "lineDiff: append 2 → 2 additions");
+  assertEq(r3.deletions, 0, "lineDiff: append 2 → 0 deletions");
+
+  const r4 = lineDiff("a\nb\nc\nd", "a\nb");
+  assertEq(r4.additions, 0, "lineDiff: delete 2 → 0 additions");
+  assertEq(r4.deletions, 2, "lineDiff: delete 2 → 2 deletions");
+
+  const r5 = lineDiff("", "new\nfile");
+  assertEq(r5.additions, 2, "lineDiff: empty→2 lines → 2 additions");
+  assertEq(r5.deletions, 0, "lineDiff: empty→2 lines → 0 deletions");
+
+  const r6 = lineDiff("x\ny\nz", "");
+  assertEq(r6.additions, 0, "lineDiff: 3 lines→empty → 0 additions");
+  assertEq(r6.deletions, 3, "lineDiff: 3 lines→empty → 3 deletions");
+}
+
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 try { rmSync(tmpDir, { recursive: true }); } catch {}

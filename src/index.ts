@@ -303,6 +303,66 @@ function applySingleEdit(lines: string[], edit: EditOp): string[] {
   }
 }
 
+// ─── Line Diff (for TUI metadata) ────────────────────────────────────────────
+
+function lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
+  const a = oldText === "" ? [] : oldText.split("\n");
+  const b = newText === "" ? [] : newText.split("\n");
+  const m = a.length;
+  const n = b.length;
+
+  let prefix = 0;
+  while (prefix < m && prefix < n && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < m - prefix && suffix < n - prefix && a[m - 1 - suffix] === b[n - 1 - suffix]) suffix++;
+
+  const aMid = a.slice(prefix, m - suffix);
+  const bMid = b.slice(prefix, n - suffix);
+
+  if (aMid.length === 0) return { additions: bMid.length, deletions: 0 };
+  if (bMid.length === 0) return { additions: 0, deletions: aMid.length };
+
+  const dp: number[][] = Array.from({ length: aMid.length + 1 }, () => new Array(bMid.length + 1).fill(0));
+  for (let i = 1; i <= aMid.length; i++) {
+    for (let j = 1; j <= bMid.length; j++) {
+      dp[i]![j] = aMid[i - 1] === bMid[j - 1] ? dp[i - 1]![j - 1]! + 1 : Math.max(dp[i - 1]![j]!, dp[i]![j - 1]!);
+    }
+  }
+
+  let additions = 0;
+  let deletions = 0;
+  let i = aMid.length;
+  let j = bMid.length;
+  while (i > 0 && j > 0) {
+    if (aMid[i - 1] === bMid[j - 1]) {
+      i--;
+      j--;
+    } else if (dp[i - 1]![j]! >= dp[i]![j - 1]!) {
+      deletions++;
+      i--;
+    } else {
+      additions++;
+      j--;
+    }
+  }
+  while (i > 0) { deletions++; i--; }
+  while (j > 0) { additions++; j--; }
+
+  return { additions, deletions };
+}
+
+// ─── Edit Metadata (execute → after hook bridge) ─────────────────────────────
+
+interface FileDiffMetadata {
+  file: string;
+  before: string;
+  after: string;
+  additions: number;
+  deletions: number;
+}
+
+let pendingEditMetadata: { filediff: FileDiffMetadata; title: string } | null = null;
+
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
 
 async function executeHashlineEdit(args: { input: string }): Promise<string> {
@@ -312,7 +372,7 @@ async function executeHashlineEdit(args: { input: string }): Promise<string> {
     return "Error: no valid patch sections found. Expected [PATH#TAG] header followed by operations.";
   }
 
-  const prepared: { path: string; newText: string }[] = [];
+  const prepared: { path: string; newText: string; oldText: string }[] = [];
 
   for (const section of sections) {
     const canonical = canonicalPath(section.path);
@@ -335,19 +395,33 @@ async function executeHashlineEdit(args: { input: string }): Promise<string> {
     }
 
     const newText = applyEdits(normalized, section.edits);
-    prepared.push({ path: section.path, newText });
+    prepared.push({ path: section.path, newText, oldText: normalized });
   }
 
   const results: string[] = [];
+  const filediffs: FileDiffMetadata[] = [];
 
   for (const entry of prepared) {
     writeFileSync(entry.path, entry.newText);
     const canonical = canonicalPath(entry.path);
     const newHash = snapshotStore.record(canonical, entry.newText);
 
+    const { additions, deletions } = lineDiff(entry.oldText, entry.newText);
+    filediffs.push({
+      file: entry.path,
+      before: entry.oldText,
+      after: entry.newText,
+      additions,
+      deletions,
+    });
+
     const changedLines = entry.newText.split("\n");
     const linePreview = changedLines.slice(0, 50).map((line, i) => `${i + 1}:${line}`).join("\n");
     results.push(`Edited [${entry.path}#${newHash}]\n${linePreview}`);
+  }
+
+  if (filediffs.length > 0) {
+    pendingEditMetadata = { filediff: filediffs[0]!, title: filediffs[0]!.file };
   }
 
   return results.join("\n\n");
@@ -481,6 +555,12 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
         } else {
           output.output = `[${callInfo.filePath}#${hash}]`;
         }
+      }
+
+      if (input.tool === "edit" && pendingEditMetadata) {
+        output.metadata = { filediff: pendingEditMetadata.filediff };
+        output.title = pendingEditMetadata.title;
+        pendingEditMetadata = null;
       }
     },
 
