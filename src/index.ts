@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { readFileSync, realpathSync, writeFileSync, existsSync } from "fs";
 import { createHash } from "crypto";
+import * as path from "path";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -22,6 +23,21 @@ interface PatchSection {
   hash: string;
   edits: EditOp[];
 }
+
+interface FileDiffMetadata {
+  file: string;
+  before: string;
+  after: string;
+  additions: number;
+  deletions: number;
+}
+
+type EditContext = {
+  worktree: string;
+  metadata(input: { title?: string; metadata?: { [key: string]: any } }): void;
+};
+
+type ToolResult = { output: string; metadata?: { [key: string]: any }; title?: string };
 
 // ─── Hash Computation ────────────────────────────────────────────────────────
 
@@ -134,6 +150,11 @@ function canonicalPath(filePath: string): string {
   } catch {
     return filePath;
   }
+}
+
+function relativePath(from: string, to: string): string {
+  const rel = path.relative(from, to);
+  return rel || to;
 }
 
 // ─── Call Tracking (tool.execute.before → after bridge) ──────────────────────
@@ -351,25 +372,13 @@ function lineDiff(oldText: string, newText: string): { additions: number; deleti
   return { additions, deletions };
 }
 
-// ─── Edit Metadata (execute → after hook bridge) ─────────────────────────────
-
-interface FileDiffMetadata {
-  file: string;
-  before: string;
-  after: string;
-  additions: number;
-  deletions: number;
-}
-
-let pendingEditMetadata: { filediff: FileDiffMetadata; title: string } | null = null;
 
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
 
-async function executeHashlineEdit(args: { input: string }): Promise<string> {
+async function executeHashlineEdit(args: { input: string }, context: EditContext): Promise<ToolResult> {
   const sections = parsePatch(args.input);
-
   if (sections.length === 0) {
-    return "Error: no valid patch sections found. Expected [PATH#TAG] header followed by operations.";
+    return { output: "Error: no valid patch sections found. Expected [PATH#TAG] header followed by operations." };
   }
 
   const prepared: { path: string; newText: string; oldText: string }[] = [];
@@ -378,7 +387,7 @@ async function executeHashlineEdit(args: { input: string }): Promise<string> {
     const canonical = canonicalPath(section.path);
 
     if (!existsSync(section.path)) {
-      return `Error: file not found: ${section.path}`;
+      return { output: `Error: file not found: ${section.path}` };
     }
 
     const rawContent = readFileSync(section.path, "utf-8");
@@ -388,9 +397,9 @@ async function executeHashlineEdit(args: { input: string }): Promise<string> {
     if (currentHash !== section.hash) {
       const snapshot = snapshotStore.byHash(canonical, section.hash);
       if (snapshot) {
-        return `Error: edit rejected—file changed since last read.\n\nSection is bound to #${section.hash}, but the current file hashes to #${currentHash}.\n\nRe-read the file with \`read\` to get a fresh [${section.path}#${currentHash}] header, then retry your edit.`;
+        return { output: `Error: edit rejected—file changed since last read.\n\nSection is bound to #${section.hash}, but the current file hashes to #${currentHash}.\n\nRe-read the file with \`read\` to get a fresh [${section.path}#${currentHash}] header, then retry your edit.` };
       } else {
-        return `Error: edit rejected—hash #${section.hash} is not from this session.\n\nThe current file hashes to #${currentHash}.\n\nRe-read the file with \`read\` to get a fresh [${section.path}#${currentHash}] header—never invent the tag and never reuse one from a prior session.`;
+        return { output: `Error: edit rejected—hash #${section.hash} is not from this session.\n\nThe current file hashes to #${currentHash}.\n\nRe-read the file with \`read\` to get a fresh [${section.path}#${currentHash}] header—never invent the tag and never reuse one from a prior session.` };
       }
     }
 
@@ -421,10 +430,11 @@ async function executeHashlineEdit(args: { input: string }): Promise<string> {
   }
 
   if (filediffs.length > 0) {
-    pendingEditMetadata = { filediff: filediffs[0]!, title: filediffs[0]!.file };
+    const title = context.worktree ? relativePath(context.worktree, filediffs[0]!.file) : filediffs[0]!.file;
+    context.metadata({ metadata: { filediff: filediffs[0]!, diagnostics: {} } });
+    return { output: results.join("\n\n"), metadata: { filediff: filediffs[0]!, diagnostics: {} }, title };
   }
-
-  return results.join("\n\n");
+  return { output: results.join("\n\n") };
 }
 
 // ─── System Prompt ───────────────────────────────────────────────────────────
@@ -556,12 +566,6 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
           output.output = `[${callInfo.filePath}#${hash}]`;
         }
       }
-
-      if (input.tool === "edit" && pendingEditMetadata) {
-        output.metadata = { filediff: pendingEditMetadata.filediff };
-        output.title = pendingEditMetadata.title;
-        pendingEditMetadata = null;
-      }
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -580,8 +584,8 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
         args: {
           input: tool.schema.string().describe("Hashline patch content. Each section: [PATH#TAG] header, then operations with +body rows."),
         },
-        async execute(args) {
-          return executeHashlineEdit(args);
+        async execute(args, context) {
+          return executeHashlineEdit(args, context);
         },
       }),
     },

@@ -19,7 +19,7 @@ All hooks confirmed against `@opencode-ai/plugin` type definitions and DCP plugi
 | Hook | Signature | Purpose |
 |---|---|---|
 | `tool.execute.before` | `(input: {tool, sessionID, callID}, output: {args}) => Promise<void>` | Stash `callID → {filePath, content}` for read/write. The `after` hook lacks args, so we capture them here. |
-| `tool.execute.after` | `(input: {tool, sessionID, callID}, output: {title, output, metadata}) => Promise<void>` | On read: prepend `[path#tag]` header to output, record snapshot. On write: record snapshot of written content. |
+| `tool.execute.after` | `(input: {tool, sessionID, callID, args}, output: {title, output, metadata}) => Promise<void>` | On read: prepend `[path#tag]` header to output, record snapshot. On write: record snapshot of written content. NOT for edit filediff—edit tools use `context.metadata()` + structured return instead. |
 | `tool: { edit: tool(...) }` | Custom tool with `{ input: string }` arg | Replaces built-in edit entirely. Plugin tools with same name take precedence. |
 | `experimental.chat.system.transform` | `(input: {model, sessionID}, output: {system: string[]}) => Promise<void>` | Inject hashline syntax prompt into system message. Append to `output.system[output.system.length - 1]`. |
 
@@ -241,14 +241,54 @@ const editTool = tool({
     input: tool.schema.string().describe("Hashline patch content")
   },
   async execute(args, context) {
-    // context: { sessionID, messageID, agent, abort }
-    // Return string (shown to model as tool result)
-    return "Edited [path#tag]\n5:new content";
+    // context: ToolContext = {
+    //   sessionID, messageID, agent, directory, worktree, abort,
+    //   metadata(input: { title?, metadata? }): void,  // emit metadata DURING execute
+    //   ask(input): Effect  // permission prompt
+    // }
+    //
+    // ToolResult = string | { output: string, metadata?: {...} }
+    // Return a structured object to emit metadata for the TUI (diffs, diagnostics, etc.)
+    context.metadata({ metadata: { filediff: { ... } } });
+    return { output: "Edited [path#tag]\n5:new content", metadata: { filediff: { ... } }, title: "rel/path" };
   }
 });
 ```
 
 If a plugin tool uses the same name as a built-in tool, the plugin tool takes precedence.
+
+### TUI Diff Preview Metadata (filediff)
+
+The TUI renders a diff preview for edit tools by reading `metadata.filediff` from the tool result. Confirmed by inspecting the opencode binary (v1.17.9) and SDK types.
+
+**Built-in edit tool emits** (from binary source):
+```javascript
+// During execute — stream metadata for live preview:
+yield* context.metadata({ metadata: { diff: m, filediff: O, diagnostics: {} } });
+// On return — final metadata + title:
+return { metadata: { diagnostics, diff: m, filediff: O }, title: relativePath, output: "Edit applied successfully." };
+```
+
+**filediff shape** (v1 SDK `FileDiff` type — the shape the TUI's diff renderer reads):
+```typescript
+type FileDiff = {
+  file: string;       // absolute path
+  before: string;     // full file content before edit
+  after: string;      // full file content after edit
+  additions: number;
+  deletions: number;
+};
+```
+
+The built-in edit tool ALSO emits a `patch` field (unified diff string) alongside `before`/`after`, but the TUI's `Yt` diff preview component reads `e.metadata?.filediff?.before` / `.after` (falling back to `e.input.oldString`/`.newString` for the built-in tool). Plugin tools have no `input.oldString`/`newString`, so `before`/`after` must be populated.
+
+**Critical**: There are two ways to emit metadata, and BOTH should be used:
+1. `context.metadata({ metadata: { filediff } })` — called during execute, enables live/streaming diff preview
+2. Return `{ output, metadata: { filediff }, title }` — structured `ToolResult`, sets final metadata + title
+
+**Wrong approach** (attempted in commit 24a3db2, didn't work): stashing metadata in a module-level variable (`pendingEditMetadata`) and reading it in `tool.execute.after`. The built-in edit tool does NOT use `tool.execute.after` for filediff emission — it uses `context.metadata()` + structured return. The `tool.execute.after` hook is for read/write snapshot recording, not edit metadata.
+
+**Title**: should be the worktree-relative path (e.g. `src/index.ts`), matching what the built-in tool emits via `path.relative(worktree, absPath)`.
 
 ## Reference: The Harness Problem
 
