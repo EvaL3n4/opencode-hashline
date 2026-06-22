@@ -1,0 +1,27 @@
+{
+  "name": "opencode-hashline",
+  "version": "0.1.0",
+  "description": "Hash-anchored editing plugin for OpenCode—rejects edits to stale file snapshots",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "lsp",
+    "edit",
+    "hash",
+    "hashline"
+  ],
+  "license": "MIT",
+  "author": "EvaL3n4",
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "xxhash-wasm": "^1.1.0"
+  }
+}
