@@ -34,6 +34,12 @@ interface FileDiffMetadata {
   deletions: number;
 }
 
+interface CompactDiffPreview {
+  preview: string;
+  addedLines: number;
+  removedLines: number;
+}
+
 type EditContext = {
   worktree: string;
   metadata(input: { title?: string; metadata?: { [key: string]: any } }): void;
@@ -482,6 +488,27 @@ function validateLineBounds(edits: readonly EditOp[], fileLines: readonly string
   return null;
 }
 
+function trailingPhantomLine(fileLines: readonly string[]): number {
+  return fileLines.length > 1 && fileLines[fileLines.length - 1]! === "" ? fileLines.length : 0;
+}
+
+function dropTrailingPhantomDeletes(edits: readonly EditOp[], fileLines: readonly string[]): EditOp[] {
+  const phantomLine = trailingPhantomLine(fileLines);
+  if (phantomLine === 0) return [...edits];
+  const result: EditOp[] = [];
+  for (const edit of edits) {
+    if (edit.kind === "delete") {
+      if (edit.start === phantomLine && edit.end === phantomLine) continue;
+      if (edit.end === phantomLine && edit.start < phantomLine) {
+        result.push({ kind: "delete", start: edit.start, end: phantomLine - 1 });
+        continue;
+      }
+    }
+    result.push(edit);
+  }
+  return result;
+}
+
 function applySingleEdit(lines: string[], edit: EditOp): string[] {
   switch (edit.kind) {
     case "swap": {
@@ -561,6 +588,129 @@ function lineDiff(oldText: string, newText: string): { additions: number; deleti
   while (j > 0) { additions++; j--; }
 
   return { additions, deletions };
+}
+
+// ─── Compact Diff Preview ────────────────────────────────────────────────────
+
+const DEFAULT_ADDED_RUN_CONTEXT_LINES = 2;
+const PREVIEW_ELISION_MARKER = "…";
+const PREVIEW_GAP_ROW = "";
+const RAW_ELISION_MARKERS = new Set(["...", PREVIEW_ELISION_MARKER, `+${PREVIEW_ELISION_MARKER}`]);
+
+function isPreviewSeparator(line: string | undefined): boolean {
+  return line === PREVIEW_ELISION_MARKER || line === PREVIEW_GAP_ROW;
+}
+
+function appendPreviewLine(output: string[], line: string): void {
+  const normalized = RAW_ELISION_MARKERS.has(line) ? PREVIEW_ELISION_MARKER : line;
+  if (isPreviewSeparator(normalized) && (output.length === 0 || isPreviewSeparator(output[output.length - 1]))) {
+    return;
+  }
+  output.push(normalized);
+}
+
+interface ParsedNumberedDiffLine {
+  kind: "+" | "-" | " ";
+  lineNumber: number;
+  content: string;
+}
+
+function parseNumberedDiffLine(line: string): ParsedNumberedDiffLine | undefined {
+  const kind = line[0];
+  if (kind !== "+" && kind !== "-" && kind !== " ") return undefined;
+
+  const body = line.slice(1);
+  const sep = body.indexOf("|");
+  if (sep === -1) return undefined;
+
+  const lineNumber = Number.parseInt(body.slice(0, sep), 10);
+  if (!Number.isFinite(lineNumber)) return undefined;
+
+  return { kind, lineNumber, content: body.slice(sep + 1) };
+}
+
+function appendAddedRun(output: string[], run: string[], edgeLines: number): void {
+  if (run.length === 0) return;
+
+  const collapseThreshold = edgeLines * 2 + 1;
+  if (run.length <= collapseThreshold) {
+    for (const text of run) appendPreviewLine(output, text);
+    return;
+  }
+
+  for (let i = 0; i < edgeLines; i++) appendPreviewLine(output, run[i]!);
+  appendPreviewLine(output, PREVIEW_ELISION_MARKER);
+  for (let i = run.length - edgeLines; i < run.length; i++) appendPreviewLine(output, run[i]!);
+}
+
+function buildCompactDiffPreview(diff: string): CompactDiffPreview {
+  const lines = diff.length === 0 ? [] : diff.split("\n");
+  const addedRunContext = DEFAULT_ADDED_RUN_CONTEXT_LINES;
+  let addedLines = 0;
+  let removedLines = 0;
+  const formatted: string[] = [];
+  const addedRun: string[] = [];
+
+  const flushAddedRun = (): void => {
+    appendAddedRun(formatted, addedRun, addedRunContext);
+    addedRun.length = 0;
+  };
+
+  for (const line of lines) {
+    const parsed = parseNumberedDiffLine(line);
+    if (!parsed) {
+      flushAddedRun();
+      appendPreviewLine(formatted, line);
+      continue;
+    }
+
+    switch (parsed.kind) {
+      case "+": {
+        addedLines++;
+        addedRun.push(`${parsed.lineNumber}:${parsed.content}`);
+        break;
+      }
+      case "-":
+        flushAddedRun();
+        removedLines++;
+        break;
+      default: {
+        flushAddedRun();
+        const newLineNumber = parsed.lineNumber + addedLines - removedLines;
+        appendPreviewLine(formatted, `${newLineNumber}:${parsed.content}`);
+        break;
+      }
+    }
+  }
+  flushAddedRun();
+  while (formatted.length > 0 && isPreviewSeparator(formatted[formatted.length - 1])) formatted.pop();
+
+  return { preview: formatted.join("\n"), addedLines, removedLines };
+}
+
+function buildNumberedDiff(oldText: string, newText: string): string {
+  const patch = structuredPatch("", "", oldText, newText, "", "", { context: 3 });
+  const lines: string[] = [];
+  for (const hunk of patch.hunks) {
+    let oldLine = hunk.oldStart;
+    let newLine = hunk.newStart;
+    for (const hunkLine of hunk.lines) {
+      const prefix = hunkLine[0];
+      const content = hunkLine.slice(1);
+      if (prefix === " ") {
+        lines.push(` ${oldLine}|${content}`);
+        oldLine++;
+        newLine++;
+      } else if (prefix === "-") {
+        lines.push(`-${oldLine}|${content}`);
+        oldLine++;
+      } else if (prefix === "+") {
+        lines.push(`+${newLine}|${content}`);
+        newLine++;
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 // ─── Boundary Repair ─────────────────────────────────────────────────────────
@@ -1082,6 +1232,19 @@ function formatMismatchError(details: MismatchDetails): string {
   return new MismatchError(details).displayMessage;
 }
 
+function assertUniqueCanonicalPaths(sections: PatchSection[]): string | null {
+  const seen = new Map<string, string>();
+  for (const section of sections) {
+    const canonical = canonicalPath(section.path);
+    const previous = seen.get(canonical);
+    if (previous !== undefined) {
+      return `Multiple sections resolve to the same file (${previous} and ${section.path}). Merge their ops under one [PATH#TAG] header before applying.`;
+    }
+    seen.set(canonical, section.path);
+  }
+  return null;
+}
+
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
 
 async function executeHashlineEdit(args: { input: string }, context: EditContext): Promise<ToolResult> {
@@ -1094,6 +1257,8 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
   if (sections.length === 0) {
     return { output: "Error: no valid patch sections found. Expected [PATH#TAG] header followed by operations." };
   }
+  const dupError = assertUniqueCanonicalPaths(sections);
+  if (dupError) return { output: `Error: ${dupError}` };
 
   const prepared: { path: string; newText: string; oldText: string; bom: string; lineEnding: LineEnding; warnings: string[] }[] = [];
 
@@ -1120,7 +1285,8 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
           return { output: `Error: ${boundsError}` };
         }
         const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(section.edits, fileLines);
-        const newText = applyEdits(normalized, repairedEdits);
+        const phantomSafeEdits = dropTrailingPhantomDeletes(repairedEdits, fileLines);
+        const newText = applyEdits(normalized, phantomSafeEdits);
         prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: [HEADTAIL_DRIFT_WARNING, ...repairWarnings] });
         continue;
       }
@@ -1152,7 +1318,8 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
       return { output: `Error: ${boundsError}` };
     }
     const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(section.edits, fileLines);
-    const newText = applyEdits(normalized, repairedEdits);
+    const phantomSafeEdits = dropTrailingPhantomDeletes(repairedEdits, fileLines);
+    const newText = applyEdits(normalized, phantomSafeEdits);
     prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: repairWarnings });
   }
 
@@ -1176,8 +1343,9 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
       deletions,
     });
 
-    const changedLines = entry.newText.split("\n");
-    const linePreview = changedLines.slice(0, 50).map((line, i) => `${i + 1}:${line}`).join("\n");
+    const numberedDiff = buildNumberedDiff(entry.oldText, entry.newText);
+    const compactPreview = buildCompactDiffPreview(numberedDiff);
+    const linePreview = compactPreview.preview;
     const warningPrefix = entry.warnings.length > 0 ? entry.warnings.map(w => `⚠ ${w}`).join("\n") + "\n" : "";
     results.push(`${warningPrefix}Edited [${entry.path}#${newHash}]\n${linePreview}`);
   }
