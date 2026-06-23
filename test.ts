@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import {
-  type EditOp, type CompactDiffPreview,
+  type EditOp, type CompactDiffPreview, type BlockSpan,
   detectLineEnding, normalizeToLF, restoreLineEndings, stripBom, normalizeForStorage,
   normalizeFileText, computeFileHash, SnapshotStore, snapshotStore, canonicalPath,
   parsePatch, applyEdits, lineDiff,
@@ -19,6 +19,9 @@ import {
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
   trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
   buildNumberedDiff, buildCompactDiffPreview,
+  EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
+  blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
+  insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
 } from "./src/index.ts";
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
@@ -1354,6 +1357,333 @@ console.log("\n─ Noop loop guard ─");
 
   assertEq(NOOP_HARD_LIMIT, 3, "NOOP_HARD_LIMIT: equals 3");
 }
+
+// ── Test 55: Block operations (tree-sitter) ─────────────────────────────────
+console.log("\n─ Block operations ─");
+
+{
+  const swapBlkPatch = `[t.py#A1B2]
+SWAP.BLK 1:
++def new():`;
+
+  const swapBlkSections = parsePatch(swapBlkPatch);
+  assert(swapBlkSections.length === 1, "parser: SWAP.BLK produces 1 section");
+  const swapBlkEdit = swapBlkSections[0]?.edits[0];
+  assert(swapBlkEdit?.kind === "block", "parser: SWAP.BLK edit has kind 'block'");
+  if (swapBlkEdit?.kind === "block") {
+    assertEq(swapBlkEdit.blockOp, "swap", "parser: SWAP.BLK edit has blockOp 'swap'");
+    assertEq(swapBlkEdit.anchor, 1, "parser: SWAP.BLK edit anchor = 1");
+    assertEq(swapBlkEdit.lines.length, 1, "parser: SWAP.BLK edit has 1 body line");
+    assertEq(swapBlkEdit.lines[0], "def new():", "parser: SWAP.BLK edit body line correct");
+  }
+
+  const delBlkPatch = `[t.py#A1B2]
+DEL.BLK 3`;
+
+  const delBlkSections = parsePatch(delBlkPatch);
+  const delBlkEdit = delBlkSections[0]?.edits[0];
+  assert(delBlkEdit?.kind === "block", "parser: DEL.BLK edit has kind 'block'");
+  if (delBlkEdit?.kind === "block") {
+    assertEq(delBlkEdit.blockOp, "delete", "parser: DEL.BLK edit has blockOp 'delete'");
+    assertEq(delBlkEdit.anchor, 3, "parser: DEL.BLK edit anchor = 3");
+    assertEq(delBlkEdit.lines.length, 0, "parser: DEL.BLK edit has empty body (intentional)");
+  }
+
+  const insBlkPostPatch = `[t.py#A1B2]
+INS.BLK.POST 1:
++# sibling
++# more`;
+
+  const insBlkPostSections = parsePatch(insBlkPostPatch);
+  const insBlkPostEdit = insBlkPostSections[0]?.edits[0];
+  assert(insBlkPostEdit?.kind === "block", "parser: INS.BLK.POST edit has kind 'block'");
+  if (insBlkPostEdit?.kind === "block") {
+    assertEq(insBlkPostEdit.blockOp, "insert_after", "parser: INS.BLK.POST edit has blockOp 'insert_after'");
+    assertEq(insBlkPostEdit.anchor, 1, "parser: INS.BLK.POST edit anchor = 1");
+    assertEq(insBlkPostEdit.lines.length, 2, "parser: INS.BLK.POST edit has 2 body lines");
+  }
+
+  const emptySwapBlkPatch = `[t.py#A1B2]
+SWAP.BLK 1:`;
+
+  let emptyThrew = false;
+  try { parsePatch(emptySwapBlkPatch); } catch (e) { emptyThrew = true; }
+  assert(emptyThrew, "parser: empty SWAP.BLK body throws");
+
+  const okDelBlkPatch = `[t.py#A1B2]
+DEL.BLK 5`;
+  let delBlkThrew = false;
+  try { parsePatch(okDelBlkPatch); } catch (e) { delBlkThrew = true; }
+  assert(!delBlkThrew, "parser: DEL.BLK with no body does NOT throw");
+}
+
+{
+  const noBlock: EditOp[] = [
+    { kind: "swap", start: 1, end: 1, lines: ["x"] },
+    { kind: "delete", start: 2, end: 3 },
+    { kind: "insert", position: "after", anchor: 4, lines: ["y"] },
+  ];
+  assert(!hasBlockEdit(noBlock), "hasBlockEdit: returns false when no block edits");
+
+  const withBlock: EditOp[] = [
+    { kind: "block", anchor: 1, lines: ["x"], blockOp: "swap" },
+  ];
+  assert(hasBlockEdit(withBlock), "hasBlockEdit: returns true when block edit present");
+
+  const insBlk: EditOp[] = [
+    { kind: "block", anchor: 1, lines: ["x"], blockOp: "insert_after" },
+  ];
+  assert(hasBlockEdit(insBlk), "hasBlockEdit: returns true for insert_after block");
+}
+
+{
+  const msg = blockUnresolvedMessage(5, "replace");
+  assert(msg.includes("SWAP.BLK 5"), "blockUnresolvedMessage: contains SWAP.BLK 5");
+  assert(msg.includes("SWAP 5.=M"), "blockUnresolvedMessage: contains fallback SWAP 5.=M");
+  assert(msg.includes("could not resolve"), "blockUnresolvedMessage: contains 'could not resolve'");
+
+  const msgDel = blockUnresolvedMessage(7, "delete");
+  assert(msgDel.includes("DEL.BLK 7"), "blockUnresolvedMessage: contains DEL.BLK 7");
+  assert(msgDel.includes("DEL 7.=M"), "blockUnresolvedMessage: contains fallback DEL 7.=M");
+
+  const singleMsg = blockSingleLineMessage(3, "replace");
+  assert(singleMsg.includes("SWAP.BLK 3"), "blockSingleLineMessage: contains SWAP.BLK 3");
+  assert(singleMsg.includes("single-line block"), "blockSingleLineMessage: contains 'single-line block'");
+  assert(singleMsg.includes("SWAP 3.=3"), "blockSingleLineMessage: contains plain form fallback");
+
+  const singleDel = blockSingleLineMessage(4, "delete");
+  assert(singleDel.includes("DEL.BLK 4"), "blockSingleLineMessage: delete contains DEL.BLK 4");
+  assert(singleDel.includes("DEL 4"), "blockSingleLineMessage: delete contains plain DEL 4");
+
+  const singleIns = blockSingleLineMessage(5, "insert_after");
+  assert(singleIns.includes("INS.BLK.POST 5"), "blockSingleLineMessage: insert_after contains INS.BLK.POST 5");
+  assert(singleIns.includes("INS.POST 5"), "blockSingleLineMessage: insert_after contains plain INS.POST 5");
+
+  assert(BLOCK_RESOLVER_UNAVAILABLE.includes("not available"), "BLOCK_RESOLVER_UNAVAILABLE: contains 'not available'");
+
+  const closerWarn = insertAfterBlockCloserLoweredWarning(3);
+  assert(closerWarn.includes("INS.BLK.POST 3"), "insertAfterBlockCloserLoweredWarning: contains anchor");
+  assert(closerWarn.includes("closing delimiter"), "insertAfterBlockCloserLoweredWarning: contains 'closing delimiter'");
+
+  const unresolvedWarn = insertAfterBlockUnresolvedLoweredWarning(7);
+  assert(unresolvedWarn.includes("INS.BLK.POST 7"), "insertAfterBlockUnresolvedLoweredWarning: contains anchor");
+  assert(unresolvedWarn.includes("could not resolve"), "insertAfterBlockUnresolvedLoweredWarning: contains 'could not resolve'");
+}
+
+{
+  assertEq(EXTENSION_TO_WASM[".ts"], "tree-sitter-typescript.wasm", "EXTENSION_TO_WASM: .ts");
+  assertEq(EXTENSION_TO_WASM[".tsx"], "tree-sitter-tsx.wasm", "EXTENSION_TO_WASM: .tsx");
+  assertEq(EXTENSION_TO_WASM[".js"], "tree-sitter-javascript.wasm", "EXTENSION_TO_WASM: .js");
+  assertEq(EXTENSION_TO_WASM[".py"], "tree-sitter-python.wasm", "EXTENSION_TO_WASM: .py");
+  assertEq(EXTENSION_TO_WASM[".rs"], "tree-sitter-rust.wasm", "EXTENSION_TO_WASM: .rs");
+  assertEq(EXTENSION_TO_WASM[".go"], "tree-sitter-go.wasm", "EXTENSION_TO_WASM: .go");
+  assertEq(EXTENSION_TO_WASM[".c"], "tree-sitter-c.wasm", "EXTENSION_TO_WASM: .c");
+  assertEq(EXTENSION_TO_WASM[".cpp"], "tree-sitter-cpp.wasm", "EXTENSION_TO_WASM: .cpp");
+  assertEq(EXTENSION_TO_WASM[".cs"], "tree-sitter-c_sharp.wasm", "EXTENSION_TO_WASM: .cs");
+  assertEq(EXTENSION_TO_WASM[".css"], "tree-sitter-css.wasm", "EXTENSION_TO_WASM: .css");
+  assertEq(EXTENSION_TO_WASM[".php"], "tree-sitter-php.wasm", "EXTENSION_TO_WASM: .php");
+  assertEq(EXTENSION_TO_WASM[".swift"], "tree-sitter-swift.wasm", "EXTENSION_TO_WASM: .swift");
+  assertEq(EXTENSION_TO_WASM[".sol"], "tree-sitter-solidity.wasm", "EXTENSION_TO_WASM: .sol");
+  assertEq(EXTENSION_TO_WASM[".vue"], "tree-sitter-vue.wasm", "EXTENSION_TO_WASM: .vue");
+  assert(EXTENSION_TO_WASM[".unknown"] === undefined, "EXTENSION_TO_WASM: unknown extension → undefined");
+}
+
+await (async () => {
+  const unsupportedPath = "/tmp/file.unknown";
+  const sampleText = "line 1\nline 2\nline 3\n";
+
+  const insBlk: EditOp[] = [
+    { kind: "block", anchor: 1, lines: ["x"], blockOp: "insert_after" },
+  ];
+  const insResult = await resolveBlockEdits(insBlk, sampleText, unsupportedPath);
+  assert(insResult.warnings.length === 1, "resolveBlockEdits: INS.BLK.POST unsupported → 1 warning");
+  assert(insResult.warnings[0]!.includes("INS.BLK.POST 1"), "resolveBlockEdits: INS.BLK.POST warning contains anchor");
+  assert(insResult.edits.length === 1, "resolveBlockEdits: INS.BLK.POST unresolved → 1 edit");
+  const insEdit = insResult.edits[0]!;
+  assert(insEdit.kind === "insert", "resolveBlockEdits: INS.BLK.POST lowered to insert");
+  if (insEdit.kind === "insert") {
+    assertEq(insEdit.position, "after", "resolveBlockEdits: lowered insert position is 'after'");
+    assertEq(insEdit.anchor, 1, "resolveBlockEdits: lowered insert anchor preserved");
+    assertEq(insEdit.lines[0], "x", "resolveBlockEdits: lowered insert lines preserved");
+  }
+
+  const swapBlk: EditOp[] = [
+    { kind: "block", anchor: 1, lines: ["y"], blockOp: "swap" },
+  ];
+  let swapThrew = false;
+  try { await resolveBlockEdits(swapBlk, sampleText, unsupportedPath); } catch (e) { swapThrew = true; }
+  assert(swapThrew, "resolveBlockEdits: SWAP.BLK unsupported → throws");
+
+  const delBlk: EditOp[] = [
+    { kind: "block", anchor: 1, lines: [], blockOp: "delete" },
+  ];
+  let delThrew = false;
+  try { await resolveBlockEdits(delBlk, sampleText, unsupportedPath); } catch (e) { delThrew = true; }
+  assert(delThrew, "resolveBlockEdits: DEL.BLK unsupported → throws");
+
+  const passthrough: EditOp[] = [
+    { kind: "swap", start: 1, end: 1, lines: ["a"] },
+  ];
+  const passResult = await resolveBlockEdits(passthrough, sampleText, unsupportedPath);
+  assertEq(passResult.warnings.length, 0, "resolveBlockEdits: non-block edits → no warnings");
+  assertEq(passResult.edits.length, 1, "resolveBlockEdits: non-block edits → 1 edit");
+  assertEq(passResult.edits[0]?.kind, "swap", "resolveBlockEdits: non-block swap preserved");
+
+  const mixed: EditOp[] = [
+    { kind: "swap", start: 1, end: 1, lines: ["a"] },
+    { kind: "block", anchor: 2, lines: ["b"], blockOp: "insert_after" },
+  ];
+  const mixedResult = await resolveBlockEdits(mixed, sampleText, unsupportedPath);
+  assertEq(mixedResult.edits.length, 2, "resolveBlockEdits: mixed edits → 2 edits");
+  assertEq(mixedResult.warnings.length, 1, "resolveBlockEdits: mixed edits → 1 warning (for the block)");
+
+  const pySource = [
+    "def greet(name):",
+    "    msg = 'Hello, ' + name",
+    "    print(msg)",
+    "",
+  ].join("\n");
+  const pyPath = "/tmp/test_block.py";
+  writeFileSync(pyPath, pySource);
+
+  const swapBlkPy: EditOp[] = [
+    { kind: "block", anchor: 1, lines: ["def new_greet():", "    pass"], blockOp: "swap" },
+  ];
+  const pyResult = await resolveBlockEdits(swapBlkPy, pySource, pyPath);
+  assertEq(pyResult.warnings.length, 0, "resolveBlockEdits: SWAP.BLK on Python function → no warnings");
+  assertEq(pyResult.edits.length, 1, "resolveBlockEdits: SWAP.BLK on Python function → 1 edit");
+  const pyEdit = pyResult.edits[0]!;
+  assertEq(pyEdit.kind, "swap", "resolveBlockEdits: SWAP.BLK resolved to swap");
+  if (pyEdit.kind === "swap") {
+    assertEq(pyEdit.start, 1, "resolveBlockEdits: SWAP.BLK start=1");
+    assertEq(pyEdit.end, 3, "resolveBlockEdits: SWAP.BLK end=3");
+    assertEq(pyEdit.lines[0], "def new_greet():", "resolveBlockEdits: SWAP.BLK body preserved");
+  }
+
+  const delBlkPy: EditOp[] = [
+    { kind: "block", anchor: 1, lines: [], blockOp: "delete" },
+  ];
+  const delResult = await resolveBlockEdits(delBlkPy, pySource, pyPath);
+  assertEq(delResult.warnings.length, 0, "resolveBlockEdits: DEL.BLK on Python function → no warnings");
+  assertEq(delResult.edits.length, 1, "resolveBlockEdits: DEL.BLK on Python function → 1 edit");
+  const delEdit = delResult.edits[0]!;
+  assertEq(delEdit.kind, "delete", "resolveBlockEdits: DEL.BLK resolved to delete");
+  if (delEdit.kind === "delete") {
+    assertEq(delEdit.start, 1, "resolveBlockEdits: DEL.BLK start=1");
+    assertEq(delEdit.end, 3, "resolveBlockEdits: DEL.BLK end=3");
+  }
+
+  const insBlkPy: EditOp[] = [
+    { kind: "block", anchor: 1, lines: ["# sibling"], blockOp: "insert_after" },
+  ];
+  const insPyResult = await resolveBlockEdits(insBlkPy, pySource, pyPath);
+  assertEq(insPyResult.warnings.length, 0, "resolveBlockEdits: INS.BLK.POST on Python function → no warnings");
+  assertEq(insPyResult.edits.length, 1, "resolveBlockEdits: INS.BLK.POST on Python function → 1 edit");
+  const insPyEdit = insPyResult.edits[0]!;
+  assertEq(insPyEdit.kind, "insert", "resolveBlockEdits: INS.BLK.POST resolved to insert");
+  if (insPyEdit.kind === "insert") {
+    assertEq(insPyEdit.position, "after", "resolveBlockEdits: INS.BLK.POST position is 'after'");
+    assertEq(insPyEdit.anchor, 3, "resolveBlockEdits: INS.BLK.POST anchor=3 (end of function)");
+  }
+
+  const directSpan = await resolveBlock(pyPath, pySource, 1);
+  assert(directSpan !== null, "resolveBlock: direct call resolves Python function");
+  if (directSpan) {
+    assertEq(directSpan.start, 1, "resolveBlock: start=1");
+    assertEq(directSpan.end, 3, "resolveBlock: end=3");
+  }
+
+  const directSpan3 = await resolveBlock(pyPath, pySource, 3);
+  assert(directSpan3 !== null, "resolveBlock: direct call resolves inner line");
+  if (directSpan3) {
+    assertEq(directSpan3.start, 3, `resolveBlock: start=3 (got ${directSpan3.start})`);
+  }
+
+  const cachedSpan = await resolveBlock(pyPath, pySource, 1);
+  assert(cachedSpan !== null, "resolveBlock: second call returns same result (cached)");
+  if (directSpan && cachedSpan) {
+    assertEq(cachedSpan.start, directSpan.start, "resolveBlock: cached call preserves start");
+    assertEq(cachedSpan.end, directSpan.end, "resolveBlock: cached call preserves end");
+  }
+
+  const syncSpan = resolveBlockSpan(pySource, 1);
+  assert(syncSpan !== null, "resolveBlockSpan: direct sync call resolves");
+  if (syncSpan) {
+    assertEq(syncSpan.start, 1, "resolveBlockSpan: start=1");
+    assertEq(syncSpan.end, 3, "resolveBlockSpan: end=3");
+  }
+
+  // P0 regression: Python source with trailing content after line-1 construct
+  // The walk-up loop must NOT include the root node, or SWAP.BLK 1 would
+  // resolve to the entire file span and silently destroy trailing code.
+  const pySourceTrailing = [
+    "def greet(name):",
+    "    msg = 'Hello, ' + name",
+    "    print(msg)",
+    "",
+    "x = 1",
+  ].join("\n");
+  const pyPathTrailing = "/tmp/test_block_trailing.py";
+  writeFileSync(pyPathTrailing, pySourceTrailing);
+
+  const trailingSpan = await resolveBlock(pyPathTrailing, pySourceTrailing, 1);
+  assert(trailingSpan !== null, "resolveBlock: Python with trailing content → resolves");
+  if (trailingSpan) {
+    assertEq(trailingSpan.start, 1, "resolveBlock: Python with trailing content → start=1");
+    assertEq(trailingSpan.end, 3, "resolveBlock: Python with trailing content → end=3 (NOT 5)");
+  }
+
+  // P0 regression: end-to-end SWAP.BLK on Python with trailing content.
+  // Pre-fix, this would have swapped the ENTIRE file (silent data loss).
+  const trailingSwapResult = await resolveBlockEdits(
+    [{ kind: "block", anchor: 1, lines: ["def new_greet():", "    pass"], blockOp: "swap" }],
+    pySourceTrailing,
+    pyPathTrailing,
+  );
+  assertEq(trailingSwapResult.warnings.length, 0, "resolveBlockEdits: SWAP.BLK trailing → no warnings");
+  assertEq(trailingSwapResult.edits.length, 1, "resolveBlockEdits: SWAP.BLK trailing → 1 edit");
+  const trailingSwapEdit = trailingSwapResult.edits[0]!;
+  if (trailingSwapEdit.kind === "swap") {
+    assertEq(trailingSwapEdit.start, 1, "resolveBlockEdits: SWAP.BLK trailing → start=1");
+    assertEq(trailingSwapEdit.end, 3, "resolveBlockEdits: SWAP.BLK trailing → end=3 (function only)");
+  }
+
+  // P0 regression: end-to-end DEL.BLK on Python with trailing content.
+  // Pre-fix, this would have deleted the ENTIRE file.
+  const trailingDelResult = await resolveBlockEdits(
+    [{ kind: "block", anchor: 1, lines: [], blockOp: "delete" }],
+    pySourceTrailing,
+    pyPathTrailing,
+  );
+  assertEq(trailingDelResult.edits.length, 1, "resolveBlockEdits: DEL.BLK trailing → 1 edit");
+  const trailingDelEdit = trailingDelResult.edits[0]!;
+  if (trailingDelEdit.kind === "delete") {
+    assertEq(trailingDelEdit.start, 1, "resolveBlockEdits: DEL.BLK trailing → start=1");
+    assertEq(trailingDelEdit.end, 3, "resolveBlockEdits: DEL.BLK trailing → end=3 (function only)");
+  }
+
+  // P0 regression: TypeScript function with trailing content.
+  const tsSourceTrailing = [
+    "function foo() {",
+    "  return 1;",
+    "}",
+    "",
+    "const bar = 2;",
+  ].join("\n");
+  const tsPathTrailing = "/tmp/test_block_trailing.ts";
+  writeFileSync(tsPathTrailing, tsSourceTrailing);
+
+  const tsTrailingSpan = await resolveBlock(tsPathTrailing, tsSourceTrailing, 1);
+  assert(tsTrailingSpan !== null, "resolveBlock: TypeScript with trailing content → resolves");
+  if (tsTrailingSpan) {
+    assertEq(tsTrailingSpan.start, 1, "resolveBlock: TypeScript with trailing content → start=1");
+    assertEq(tsTrailingSpan.end, 3, "resolveBlock: TypeScript with trailing content → end=3 (NOT 5)");
+  }
+
+  try { rmSync(pyPath); } catch {}
+  try { rmSync(pyPathTrailing); } catch {}
+  try { rmSync(tsPathTrailing); } catch {}
+})();
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 

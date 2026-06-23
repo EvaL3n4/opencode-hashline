@@ -3,6 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { readFileSync, realpathSync, writeFileSync, existsSync } from "fs";
 import { createHash } from "crypto";
 import * as path from "path";
+import { createRequire } from "module";
 import { createTwoFilesPatch, structuredPatch, applyPatch } from "diff";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -18,7 +19,13 @@ interface Snapshot {
 type EditOp =
   | { kind: "swap"; start: number; end: number; lines: string[] }
   | { kind: "delete"; start: number; end: number }
-  | { kind: "insert"; position: "before" | "after" | "head" | "tail"; anchor: number; lines: string[] };
+  | { kind: "insert"; position: "before" | "after" | "head" | "tail"; anchor: number; lines: string[] }
+  | { kind: "block"; anchor: number; lines: string[]; blockOp: "swap" | "delete" | "insert_after" };
+
+interface BlockSpan {
+  start: number;
+  end: number;
+}
 
 interface PatchSection {
   path: string;
@@ -446,6 +453,9 @@ function parsePatch(input: string): PatchSection[] {
     const insPostMatch = line.match(/^INS\.POST\s+(\d+):\s*$/);
     const insHeadMatch = line.match(/^INS\.HEAD:\s*$/);
     const insTailMatch = line.match(/^INS\.TAIL:\s*$/);
+    const swapBlkMatch = line.match(/^SWAP\.BLK\s+(\d+):\s*$/);
+    const delBlkMatch = line.match(/^DEL\.BLK\s+(\d+)\s*$/);
+    const insBlkPostMatch = line.match(/^INS\.BLK\.POST\s+(\d+):\s*$/);
 
     if (swapMatch) {
       const edit: Extract<EditOp, { kind: "swap" }> = {
@@ -496,6 +506,32 @@ function parsePatch(input: string): PatchSection[] {
       };
       currentSection.edits.push(edit);
       bodyTarget = edit.lines;
+    } else if (swapBlkMatch) {
+      const edit: Extract<EditOp, { kind: "block" }> = {
+        kind: "block",
+        anchor: parseInt(swapBlkMatch[1]!, 10),
+        lines: [],
+        blockOp: "swap",
+      };
+      currentSection.edits.push(edit);
+      bodyTarget = edit.lines;
+    } else if (delBlkMatch) {
+      currentSection.edits.push({
+        kind: "block",
+        anchor: parseInt(delBlkMatch[1]!, 10),
+        lines: [],
+        blockOp: "delete",
+      });
+      bodyTarget = null;
+    } else if (insBlkPostMatch) {
+      const edit: Extract<EditOp, { kind: "block" }> = {
+        kind: "block",
+        anchor: parseInt(insBlkPostMatch[1]!, 10),
+        lines: [],
+        blockOp: "insert_after",
+      };
+      currentSection.edits.push(edit);
+      bodyTarget = edit.lines;
     } else {
       const contamination = detectContamination(line);
       if (contamination) {
@@ -510,6 +546,9 @@ function parsePatch(input: string): PatchSection[] {
     for (const edit of section.edits) {
       if (edit.kind === "swap" && edit.lines.length === 0) {
         throw new Error("`SWAP N.=M:` needs at least one `+TEXT` body row. To delete lines, use `DEL N.=M`.");
+      }
+      if (edit.kind === "block" && edit.blockOp === "swap" && edit.lines.length === 0) {
+        throw new Error("`SWAP.BLK N:` needs at least one `+TEXT` body row. To delete a block, use `DEL.BLK N`.");
       }
     }
   }
@@ -542,6 +581,8 @@ function getAnchorLine(edit: EditOp): number {
       return edit.start;
     case "insert":
       return edit.anchor;
+    case "block":
+      return edit.anchor;
   }
 }
 
@@ -563,6 +604,8 @@ function validateLineBounds(edits: readonly EditOp[], fileLines: readonly string
         if (edit.anchor < 1 || edit.anchor > lineCount) {
           return `Line ${edit.anchor} does not exist (file has ${lineCount} lines).`;
         }
+        break;
+      case "block":
         break;
     }
   }
@@ -619,7 +662,10 @@ function applySingleEdit(lines: string[], edit: EditOp): string[] {
           return [...before, ...edit.lines, ...after];
         }
       }
+      return lines;
     }
+    case "block":
+      return lines;
   }
 }
 
@@ -1017,7 +1063,7 @@ function repairEdits(edits: readonly EditOp[], fileLines: readonly string[]): { 
       for (let l = edit.start; l <= edit.end; l++) targetedLines.add(l);
     } else if (edit.kind === "swap") {
       for (let l = edit.start; l <= edit.end; l++) targetedLines.add(l);
-    } else if (edit.position === "before" || edit.position === "after") {
+    } else if (edit.kind === "insert" && (edit.position === "before" || edit.position === "after")) {
       targetedLines.add(edit.anchor);
     }
   }
@@ -1098,6 +1144,207 @@ function repairEdits(edits: readonly EditOp[], fileLines: readonly string[]): { 
   return { edits: repaired, warnings };
 }
 
+// ─── Block Resolver (tree-sitter) ────────────────────────────────────────────
+
+const EXTENSION_TO_WASM: Record<string, string> = {
+  ".ts": "tree-sitter-typescript.wasm",
+  ".tsx": "tree-sitter-tsx.wasm",
+  ".js": "tree-sitter-javascript.wasm",
+  ".jsx": "tree-sitter-javascript.wasm",
+  ".mjs": "tree-sitter-javascript.wasm",
+  ".cjs": "tree-sitter-javascript.wasm",
+  ".py": "tree-sitter-python.wasm",
+  ".rs": "tree-sitter-rust.wasm",
+  ".go": "tree-sitter-go.wasm",
+  ".rb": "tree-sitter-ruby.wasm",
+  ".java": "tree-sitter-java.wasm",
+  ".c": "tree-sitter-c.wasm",
+  ".cpp": "tree-sitter-cpp.wasm",
+  ".cc": "tree-sitter-cpp.wasm",
+  ".cxx": "tree-sitter-cpp.wasm",
+  ".h": "tree-sitter-c.wasm",
+  ".hpp": "tree-sitter-cpp.wasm",
+  ".cs": "tree-sitter-c_sharp.wasm",
+  ".css": "tree-sitter-css.wasm",
+  ".dart": "tree-sitter-dart.wasm",
+  ".php": "tree-sitter-php.wasm",
+  ".swift": "tree-sitter-swift.wasm",
+  ".sol": "tree-sitter-solidity.wasm",
+  ".vue": "tree-sitter-vue.wasm",
+};
+
+const _require = createRequire(import.meta.url);
+let _wasmDir: string | null = null;
+function wasmDir(): string {
+  if (_wasmDir) return _wasmDir;
+  _wasmDir = path.join(path.dirname(_require.resolve("@repomix/tree-sitter-wasms/package.json")), "out");
+  return _wasmDir;
+}
+
+let parserInstance: any = null;
+const languageCache = new Map<string, any>();
+const resolutionCache = new Map<string, BlockSpan | null>();
+const RESOLUTION_CACHE_MAX = 512;
+
+async function ensureParser(): Promise<any> {
+  if (!parserInstance) {
+    const { Parser } = await import("web-tree-sitter");
+    await Parser.init();
+    parserInstance = new Parser();
+  }
+  return parserInstance;
+}
+
+async function loadLanguage(ext: string): Promise<any | null> {
+  const cached = languageCache.get(ext);
+  if (cached) return cached;
+  const wasmFile = EXTENSION_TO_WASM[ext];
+  if (!wasmFile) return null;
+  const { Language } = await import("web-tree-sitter");
+  const lang = await Language.load(path.join(wasmDir(), wasmFile));
+  languageCache.set(ext, lang);
+  return lang;
+}
+
+function resolveBlockSpan(text: string, line: number): BlockSpan | null {
+  const row = line - 1;
+  const lines = text.split("\n");
+  if (row < 0 || row >= lines.length) return null;
+
+  const lineText = lines[row]!;
+  let col = 0;
+  while (col < lineText.length && (lineText[col] === " " || lineText[col] === "\t")) col++;
+  if (col >= lineText.length) return null;
+
+  const parser = parserInstance!;
+  const tree = parser.parse(text);
+  if (!tree) return null;
+
+  const root = tree.rootNode;
+  const node = root.descendantForPosition({ row, column: col });
+  if (!node) return null;
+
+  let resolved = node;
+  while (resolved.parent && resolved.parent.parent !== null && resolved.parent.startPosition.row === resolved.startPosition.row) {
+    resolved = resolved.parent;
+  }
+
+  if (resolved.hasError) return null;
+
+  const start = resolved.startPosition.row + 1;
+  const end = resolved.endPosition.column === 0 ? resolved.endPosition.row : resolved.endPosition.row + 1;
+
+  return { start, end };
+}
+
+async function resolveBlock(filePath: string, text: string, line: number): Promise<BlockSpan | null> {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!EXTENSION_TO_WASM[ext]) return null;
+
+  const contentHash = createHash("md5").update(text).digest("hex").slice(0, 8);
+  const cacheKey = `${contentHash}:${text.length}:${line}:${filePath}`;
+  const cached = resolutionCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  await ensureParser();
+  const lang = await loadLanguage(ext);
+  if (!lang) return null;
+  parserInstance.setLanguage(lang);
+
+  const result = resolveBlockSpan(text, line);
+
+  if (resolutionCache.size >= RESOLUTION_CACHE_MAX) {
+    const oldest = resolutionCache.keys().next().value;
+    if (oldest !== undefined) resolutionCache.delete(oldest);
+  }
+  resolutionCache.set(cacheKey, result);
+
+  return result;
+}
+
+function hasBlockEdit(edits: readonly EditOp[]): boolean {
+  return edits.some(e => e.kind === "block");
+}
+
+function blockUnresolvedMessage(line: number, op: "replace" | "delete", fileLines?: string[]): string {
+  const phrase = op === "delete" ? `DEL.BLK ${line}` : `SWAP.BLK ${line}:`;
+  const fallback = op === "delete" ? `DEL ${line}.=M` : `SWAP ${line}.=M:`;
+  let message = `\`${phrase}\` could not resolve a syntactic block beginning on line ${line} (unsupported language, blank/closer line, or parse error). Use \`${fallback}\` with explicit lines.`;
+  if (fileLines) {
+    const context = formatAnchoredContext([line], fileLines);
+    if (context.length > 0) message += `\n\n${context.join("\n")}`;
+  }
+  return message;
+}
+
+function blockSingleLineMessage(line: number, op: "replace" | "delete" | "insert_after"): string {
+  const blockForm = op === "insert_after" ? "INS.BLK.POST" : op === "delete" ? "DEL.BLK" : "SWAP.BLK";
+  const plainForm = op === "insert_after" ? `INS.POST ${line}:` : op === "delete" ? `DEL ${line}` : `SWAP ${line}.=${line}:`;
+  return `\`${blockForm} ${line}\` resolved a single-line block—line ${line} is a bare statement, not the opening line of a multi-line construct. For that one line use \`${plainForm}\`; to act on an enclosing construct, anchor ${blockForm} on the line that OPENS it (e.g. its \`function\`/\`if\`/\`case\` header), never a statement inside it.`;
+}
+
+const BLOCK_RESOLVER_UNAVAILABLE = "`SWAP.BLK`/`DEL.BLK`/`INS.BLK.POST` are not available here (no block resolver configured). Use a concrete line range.";
+
+function insertAfterBlockCloserLoweredWarning(line: number): string {
+  return `\`INS.BLK.POST ${line}:\` anchors on a closing delimiter, so it was applied as plain \`INS.POST ${line}:\`. Anchor on the line that OPENS the construct.`;
+}
+
+function insertAfterBlockUnresolvedLoweredWarning(line: number): string {
+  return `\`INS.BLK.POST ${line}:\` could not resolve a syntactic block on line ${line}, so it was applied as plain \`INS.POST ${line}:\`. Verify the landing line; anchor on a line that OPENS a construct.`;
+}
+
+async function resolveBlockEdits(
+  edits: readonly EditOp[],
+  text: string,
+  filePath: string,
+): Promise<{ edits: EditOp[]; warnings: string[] }> {
+  if (!hasBlockEdit(edits)) return { edits: [...edits], warnings: [] };
+
+  const resolved: EditOp[] = [];
+  const warnings: string[] = [];
+  const fileLines = text.split("\n");
+
+  for (const edit of edits) {
+    if (edit.kind !== "block") {
+      resolved.push(edit);
+      continue;
+    }
+
+    const op = edit.blockOp;
+    const span = await resolveBlock(filePath, text, edit.anchor);
+
+    if (span === null) {
+      if (op === "insert_after") {
+        const anchorText = fileLines[edit.anchor - 1];
+        const isCloser = anchorText !== undefined && /^\s*[}\])>;]+\s*$/.test(anchorText);
+        warnings.push(isCloser ? insertAfterBlockCloserLoweredWarning(edit.anchor) : insertAfterBlockUnresolvedLoweredWarning(edit.anchor));
+        resolved.push({ kind: "insert", position: "after", anchor: edit.anchor, lines: edit.lines });
+        continue;
+      }
+      throw new Error(blockUnresolvedMessage(edit.anchor, op === "delete" ? "delete" : "replace", fileLines));
+    }
+
+    if (span.start === span.end) {
+      if (op === "insert_after") {
+        warnings.push(`\`INS.BLK.POST ${edit.anchor}:\` resolved a single-line block. Applied as plain \`INS.POST ${edit.anchor}:\`.`);
+        resolved.push({ kind: "insert", position: "after", anchor: edit.anchor, lines: edit.lines });
+        continue;
+      }
+      throw new Error(blockSingleLineMessage(edit.anchor, op === "delete" ? "delete" : "replace"));
+    }
+
+    if (op === "insert_after") {
+      resolved.push({ kind: "insert", position: "after", anchor: span.end, lines: edit.lines });
+    } else if (op === "delete") {
+      resolved.push({ kind: "delete", start: span.start, end: span.end });
+    } else {
+      resolved.push({ kind: "swap", start: span.start, end: span.end, lines: edit.lines });
+    }
+  }
+
+  return { edits: resolved, warnings };
+}
+
 // ─── Recovery (3-way merge + session-chain replay) ──────────────────────────
 
 const RECOVERY_FUZZ_FACTOR = 0;
@@ -1124,6 +1371,7 @@ function hasAnchorScopedEdit(edits: readonly EditOp[]): boolean {
   return edits.some(edit => {
     if (edit.kind === "delete") return true;
     if (edit.kind === "swap") return true;
+    if (edit.kind === "block") return true;
     return edit.position === "before" || edit.position === "after";
   });
 }
@@ -1135,6 +1383,8 @@ function collectAnchorLines(edits: readonly EditOp[]): number[] {
       for (let l = edit.start; l <= edit.end; l++) lines.push(l);
     } else if (edit.kind === "swap") {
       for (let l = edit.start; l <= edit.end; l++) lines.push(l);
+    } else if (edit.kind === "block") {
+      lines.push(edit.anchor);
     } else if (edit.position === "before" || edit.position === "after") {
       lines.push(edit.anchor);
     }
@@ -1418,7 +1668,23 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
           edits: section.edits,
         });
         if (recovered) {
-          prepared.push({ path: section.path, newText: recovered.text, oldText: normalized, bom, lineEnding, warnings: recovered.warnings });
+          let resolvedText = recovered.text;
+          let resolvedWarnings = recovered.warnings;
+          if (hasBlockEdit(section.edits)) {
+            try {
+              const { edits: resolvedEdits, warnings: blockWarnings } = await resolveBlockEdits(section.edits, resolvedText, section.path);
+              const rfileLines = resolvedText.split("\n");
+              const rboundsError = validateLineBounds(resolvedEdits, rfileLines);
+              if (rboundsError) return { output: `Error: ${rboundsError}` };
+              const { edits: rRepairedEdits, warnings: rRepairWarnings } = repairEdits(resolvedEdits, rfileLines);
+              const rPhantomSafeEdits = dropTrailingPhantomDeletes(rRepairedEdits, rfileLines);
+              resolvedText = applyEdits(resolvedText, rPhantomSafeEdits);
+              resolvedWarnings = [...resolvedWarnings, ...rRepairWarnings, ...blockWarnings];
+            } catch (e) {
+              return { output: `Error: ${(e as Error).message}` };
+            }
+          }
+          prepared.push({ path: section.path, newText: resolvedText, oldText: normalized, bom, lineEnding, warnings: resolvedWarnings });
           continue;
         }
         const fileLines = normalized.split("\n");
@@ -1434,15 +1700,30 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
     const seenError = assertSeenLines(section, canonical, section.hash);
     if (seenError) return { output: `Error: ${seenError}` };
 
+    let editsToApply: EditOp[];
+    let extraWarnings: string[];
+    if (hasBlockEdit(section.edits)) {
+      try {
+        const { edits: resolvedEdits, warnings: blockWarnings } = await resolveBlockEdits(section.edits, normalized, section.path);
+        editsToApply = resolvedEdits;
+        extraWarnings = blockWarnings;
+      } catch (e) {
+        return { output: `Error: ${(e as Error).message}` };
+      }
+    } else {
+      editsToApply = section.edits;
+      extraWarnings = [];
+    }
+
     const fileLines = normalized.split("\n");
-    const boundsError = validateLineBounds(section.edits, fileLines);
+    const boundsError = validateLineBounds(editsToApply, fileLines);
     if (boundsError) {
       return { output: `Error: ${boundsError}` };
     }
-    const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(section.edits, fileLines);
+    const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(editsToApply, fileLines);
     const phantomSafeEdits = dropTrailingPhantomDeletes(repairedEdits, fileLines);
     const newText = applyEdits(normalized, phantomSafeEdits);
-    prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: repairWarnings });
+    prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: [...extraWarnings, ...repairWarnings] });
   }
 
   const inputHash = hashPatchInput(args.input);
@@ -1509,6 +1790,9 @@ To edit, call the \`edit\` tool with a patch. Every file section starts with \`[
 \`INS.POST N:\` — insert body rows immediately after line N.
 \`INS.HEAD:\` — insert body rows at the very start of the file.
 \`INS.TAIL:\` — insert body rows at the very end of the file.
+\`SWAP.BLK N:\` — replace the whole syntactic block that BEGINS on line N; tree-sitter resolves the closing line. Body rows below.
+\`DEL.BLK N\` — delete the whole syntactic block that BEGINS on line N.
+\`INS.BLK.POST N:\` — insert the body rows after the END of the block that BEGINS on line N—outside it, at sibling depth. To append inside a block, use \`INS.POST\`.
 </ops>
 
 <body-rows>
@@ -1524,6 +1808,9 @@ Body rows appear only under a \`:\` header. Every body row is \`+TEXT\` — add 
 - On a stale-tag rejection: STOP and re-\`read\` before further edits.
 - One hunk per range; body = final content, never an old/new pair.
 - NEVER format/restyle code with this tool; run the project formatter instead.
+- Whole construct → \`SWAP.BLK N\` (tree-sitter resolves the end); lines inside it → \`SWAP N.=M\`.
+- \`SWAP.BLK N\` resolves EXACTLY the node at N. Leading decorators/attributes/doc-comments are separate nodes: point N at the FIRST decorator to sweep both; standalone line-comments are never swept—use \`SWAP N.=M\`.
+- Block ops (\`SWAP.BLK\`/\`DEL.BLK\`/\`INS.BLK.POST\`) anchor the OPENING line of a MULTI-LINE construct—never its closer, last line, or a bare inner statement. Anchoring one statement resolves to ONE line and is REJECTED: use the plain op (\`SWAP N.=N\` / \`DEL N\` / \`INS.POST N:\`), or point N at the real opener. Saw the closer? Use plain \`INS.POST M:\`.
 </rules>
 
 <example>
@@ -1556,7 +1843,33 @@ Delete line 3:
 [greet.py#A1B2]
 DEL 3
 \`\`\`
+
+Replace the whole \`greet\` function block—\`SWAP.BLK 1:\` resolves lines 1–3 (the \`def\` header through \`print(msg)\`); line 4 is a separate statement and stays:
+\`\`\`
+[greet.py#A1B2]
+SWAP.BLK 1:
++def greet(name):
++    print(f"Hello, {name}")
+\`\`\`
+
+A decorator/doc-comment is a SEPARATE block—\`SWAP.BLK\` on the \`def\`/\`fn\` line keeps it. Point N at the decorator to take both; here line 1 is \`@cache\`, so anchoring on the \`def\` (line 2) would orphan \`@cache\`:
+\`\`\`
+[svc.py#C3D4]
+SWAP.BLK 1:
++@cache
++def load(key):
++    return store[key]
+\`\`\`
 </example>
+
+<anti-patterns>
+# WRONG—\`INS.BLK.POST N:\` anchored on a closing delimiter / last visible line. RIGHT: plain \`INS.POST M:\`
+INS.BLK.POST 3:
++after()
+# RIGHT
+INS.POST 3:
++after()
+</anti-patterns>
 </hashline>
 `.trim();
 
@@ -1661,7 +1974,7 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
 export {
   type Snapshot, type EditOp, type PatchSection, type LineEnding,
   type DelimiterBalance, type BoundaryEcho, type RecoveryResult, type MismatchDetails,
-  type CompactDiffPreview,
+  type CompactDiffPreview, type BlockSpan,
   detectLineEnding, normalizeToLF, restoreLineEndings, stripBom, normalizeForStorage,
   normalizeFileText, computeFileHash, SnapshotStore, snapshotStore, canonicalPath,
   parsePatch, applyEdits, getAnchorLine, applySingleEdit, lineDiff,
@@ -1683,6 +1996,9 @@ export {
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
   trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
   buildNumberedDiff, buildCompactDiffPreview,
+  EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
+  blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
+  insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
 };
 export default HashlinePlugin;
 export { HashlinePlugin };
