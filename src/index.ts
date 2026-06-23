@@ -1152,6 +1152,16 @@ function applyEdits(text: string, edits: EditOp[]): string {
   return fileLines.join("\n");
 }
 
+async function applyPartialTo(
+  edits: readonly EditOp[],
+  text: string,
+  filePath: string,
+): Promise<{ text: string; warnings: string[] }> {
+  const { edits: resolved, warnings } = await resolveBlockEdits(edits, text, filePath, { onUnresolved: "drop" });
+  const resultText = applyEdits(text, resolved);
+  return { text: resultText, warnings };
+}
+
 function getAnchorLine(edit: EditOp): number {
   switch (edit.kind) {
     case "swap":
@@ -1416,6 +1426,87 @@ function buildNumberedDiff(oldText: string, newText: string): string {
     }
   }
   return lines.join("\n");
+}
+
+// ─── Streaming Diff Preview ───────────────────────────────────────────────────
+
+async function buildStreamingSectionDiff(
+  edits: readonly EditOp[],
+  normalized: string,
+  filePath: string,
+): Promise<{ diff: string; firstChangedLine?: number } | { error: string }> {
+  const { edits: resolved } = await resolveBlockEdits(edits, normalized, filePath, { onUnresolved: "drop" });
+  const fileLines = normalized.split("\n");
+  const sorted = [...resolved].sort((a, b) => getAnchorLine(a) - getAnchorLine(b));
+
+  const groups: Map<number, EditOp[]> = new Map();
+  for (const edit of sorted) {
+    const key = getAnchorLine(edit);
+    const list = groups.get(key);
+    if (list) list.push(edit);
+    else groups.set(key, [edit]);
+  }
+
+  const rows: string[] = [];
+  let firstChangedLine: number | undefined;
+
+  for (const [, group] of groups) {
+    const deletes: number[] = [];
+    const inserts: string[] = [];
+    let insertBase: number | undefined;
+    let baseSet = false;
+
+    for (const edit of group) {
+      if (edit.kind === "swap") {
+        for (let l = edit.start; l <= edit.end; l++) deletes.push(l);
+        for (const text of edit.lines) inserts.push(text);
+        if (!baseSet) { insertBase = edit.start; baseSet = true; }
+      } else if (edit.kind === "delete") {
+        for (let l = edit.start; l <= edit.end; l++) deletes.push(l);
+        if (!baseSet) { insertBase = edit.start; baseSet = true; }
+      } else if (edit.kind === "insert") {
+        for (const text of edit.lines) inserts.push(text);
+        if (!baseSet) {
+          switch (edit.position) {
+            case "head":
+              insertBase = 1;
+              break;
+            case "tail":
+              insertBase = fileLines.length + 1;
+              break;
+            case "before":
+              insertBase = edit.anchor;
+              break;
+            case "after":
+              insertBase = edit.anchor + 1;
+              break;
+          }
+          baseSet = true;
+        }
+      }
+    }
+
+    deletes.sort((a, b) => a - b);
+
+    for (const line of deletes) {
+      if (firstChangedLine === undefined) firstChangedLine = line;
+      const content = line >= 1 && line <= fileLines.length ? (fileLines[line - 1] ?? "") : "";
+      rows.push(`-${line}|${content}`);
+    }
+
+    let newLine = insertBase ?? deletes[0] ?? 1;
+    for (const text of inserts) {
+      if (firstChangedLine === undefined) firstChangedLine = newLine;
+      rows.push(`+${newLine}|${text}`);
+      newLine++;
+    }
+  }
+
+  if (rows.length === 0) {
+    return { error: "No changes would be made." };
+  }
+
+  return { diff: rows.join("\n"), firstChangedLine };
 }
 
 // ─── Boundary Repair ─────────────────────────────────────────────────────────
@@ -1875,9 +1966,11 @@ async function resolveBlockEdits(
   edits: readonly EditOp[],
   text: string,
   filePath: string,
+  options?: { onUnresolved?: "throw" | "drop" },
 ): Promise<{ edits: EditOp[]; warnings: string[] }> {
   if (!hasBlockEdit(edits)) return { edits: [...edits], warnings: [] };
 
+  const onUnresolved = options?.onUnresolved ?? "throw";
   const resolved: EditOp[] = [];
   const warnings: string[] = [];
   const fileLines = text.split("\n");
@@ -1899,6 +1992,11 @@ async function resolveBlockEdits(
         resolved.push({ kind: "insert", position: "after", anchor: edit.anchor, lines: edit.lines });
         continue;
       }
+      if (onUnresolved === "drop") {
+        const opLabel = op === "delete" ? "DEL.BLK" : "SWAP.BLK";
+        warnings.push(`\`${opLabel} ${edit.anchor}\` could not be resolved (tree-sitter unavailable or block not found). Skipped in streaming preview.`);
+        continue;
+      }
       throw new Error(blockUnresolvedMessage(edit.anchor, op === "delete" ? "delete" : "replace", fileLines));
     }
 
@@ -1906,6 +2004,11 @@ async function resolveBlockEdits(
       if (op === "insert_after") {
         warnings.push(`\`INS.BLK.POST ${edit.anchor}:\` resolved a single-line block. Applied as plain \`INS.POST ${edit.anchor}:\`.`);
         resolved.push({ kind: "insert", position: "after", anchor: edit.anchor, lines: edit.lines });
+        continue;
+      }
+      if (onUnresolved === "drop") {
+        const opLabel = op === "delete" ? "DEL.BLK" : "SWAP.BLK";
+        warnings.push(`\`${opLabel} ${edit.anchor}\` resolved to a single-line block. Skipped in streaming preview.`);
         continue;
       }
       throw new Error(blockSingleLineMessage(edit.anchor, op === "delete" ? "delete" : "replace"));
@@ -2343,14 +2446,18 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
 
     const { additions, deletions } = lineDiff(entry.oldText, entry.newText);
     const diffString = createTwoFilesPatch(entry.path, entry.path, entry.oldText, entry.newText);
-    filediffs.push({
+    const filediff: FileDiffMetadata = {
       file: entry.path,
       before: entry.oldText,
       after: entry.newText,
       patch: diffString,
       additions,
       deletions,
-    });
+    };
+    filediffs.push(filediff);
+
+    const title = context.worktree ? relativePath(context.worktree, entry.path) : entry.path;
+    context.metadata({ metadata: { diff: diffString, filediff, diagnostics: {} }, title });
 
     const numberedDiff = buildNumberedDiff(entry.oldText, entry.newText);
     const compactPreview = buildCompactDiffPreview(numberedDiff);
@@ -2360,10 +2467,9 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
   }
 
   if (filediffs.length > 0) {
-    const first = filediffs[0]!;
-    const title = context.worktree ? relativePath(context.worktree, first.file) : first.file;
-    context.metadata({ metadata: { diff: first.patch, filediff: first, diagnostics: {} } });
-    return { output: results.join("\n\n"), metadata: { diff: first.patch, filediff: first, diagnostics: {} }, title };
+    const last = filediffs[filediffs.length - 1]!;
+    const title = context.worktree ? relativePath(context.worktree, last.file) : last.file;
+    return { output: results.join("\n\n"), metadata: { diff: last.patch, filediff: last, diagnostics: {} }, title };
   }
   return { output: results.join("\n\n") };
 }
@@ -2694,7 +2800,8 @@ export {
   unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
   trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
-  buildNumberedDiff, buildCompactDiffPreview, buildSnapshotTable,
+  buildNumberedDiff, buildCompactDiffPreview, buildSnapshotTable, buildStreamingSectionDiff,
+  applyPartialTo,
   EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
   blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,

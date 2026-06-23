@@ -19,7 +19,8 @@ import {
   unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
   trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
-  buildNumberedDiff, buildCompactDiffPreview, buildSnapshotTable,
+  buildNumberedDiff, buildCompactDiffPreview, buildSnapshotTable, buildStreamingSectionDiff,
+  applyPartialTo,
   EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
   blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
@@ -2461,6 +2462,222 @@ console.log("\n─ Executor ─");
   assertEq(sections[0]?.path, "foo.ts", "Executor: recovery header strips noise via tokenizer");
   assertEq(sections[0]?.hash, "1A2B", "Executor: recovery header hash via tokenizer");
 }
+
+// ── Test 60: Streaming diff preview ──────────────────────────────────────────
+console.log("\n─ Streaming diff preview ─");
+
+await (async () => {
+  // 1. Basic SWAP
+  {
+    const edits: EditOp[] = [{ kind: "swap", start: 2, end: 3, lines: ["new2", "new3"] }];
+    const text = "line1\nline2\nline3\nline4";
+    const result = await buildStreamingSectionDiff(edits, text, "/tmp/file.unknown");
+    if ("error" in result) {
+      assert(false, `buildStreamingSectionDiff: basic SWAP returned error: ${result.error}`);
+    } else {
+      assertEq(result.diff, "-2|line2\n-3|line3\n+2|new2\n+3|new3", "buildStreamingSectionDiff: basic SWAP diff rows");
+      assertEq(result.firstChangedLine, 2, "buildStreamingSectionDiff: basic SWAP firstChangedLine");
+    }
+  }
+
+  // 2. DEL
+  {
+    const edits: EditOp[] = [{ kind: "delete", start: 2, end: 2 }];
+    const text = "line1\nline2\nline3";
+    const result = await buildStreamingSectionDiff(edits, text, "/tmp/file.unknown");
+    if ("error" in result) {
+      assert(false, `buildStreamingSectionDiff: DEL returned error: ${result.error}`);
+    } else {
+      assertEq(result.diff, "-2|line2", "buildStreamingSectionDiff: DEL diff rows");
+      assertEq(result.firstChangedLine, 2, "buildStreamingSectionDiff: DEL firstChangedLine");
+    }
+  }
+
+  // 3. INS.POST
+  {
+    const edits: EditOp[] = [{ kind: "insert", position: "after", anchor: 1, lines: ["inserted"] }];
+    const text = "line1\nline2";
+    const result = await buildStreamingSectionDiff(edits, text, "/tmp/file.unknown");
+    if ("error" in result) {
+      assert(false, `buildStreamingSectionDiff: INS.POST returned error: ${result.error}`);
+    } else {
+      assertEq(result.diff, "+2|inserted", "buildStreamingSectionDiff: INS.POST diff rows");
+      assertEq(result.firstChangedLine, 2, "buildStreamingSectionDiff: INS.POST firstChangedLine");
+    }
+  }
+
+  // 4. INS.HEAD
+  {
+    const edits: EditOp[] = [{ kind: "insert", position: "head", anchor: 0, lines: ["first"] }];
+    const text = "line1";
+    const result = await buildStreamingSectionDiff(edits, text, "/tmp/file.unknown");
+    if ("error" in result) {
+      assert(false, `buildStreamingSectionDiff: INS.HEAD returned error: ${result.error}`);
+    } else {
+      assertEq(result.diff, "+1|first", "buildStreamingSectionDiff: INS.HEAD diff rows");
+      assertEq(result.firstChangedLine, 1, "buildStreamingSectionDiff: INS.HEAD firstChangedLine");
+    }
+  }
+
+  // 5. INS.TAIL
+  {
+    const edits: EditOp[] = [{ kind: "insert", position: "tail", anchor: 0, lines: ["last"] }];
+    const text = "line1";
+    const result = await buildStreamingSectionDiff(edits, text, "/tmp/file.unknown");
+    if ("error" in result) {
+      assert(false, `buildStreamingSectionDiff: INS.TAIL returned error: ${result.error}`);
+    } else {
+      assertEq(result.diff, "+2|last", "buildStreamingSectionDiff: INS.TAIL diff rows");
+      assertEq(result.firstChangedLine, 2, "buildStreamingSectionDiff: INS.TAIL firstChangedLine");
+    }
+  }
+
+  // 6. Multiple ops natural order
+  {
+    const edits: EditOp[] = [
+      { kind: "delete", start: 5, end: 5 },
+      { kind: "delete", start: 2, end: 2 },
+      { kind: "delete", start: 8, end: 8 },
+    ];
+    const text = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9";
+    const result = await buildStreamingSectionDiff(edits, text, "/tmp/file.unknown");
+    if ("error" in result) {
+      assert(false, `buildStreamingSectionDiff: multi-op returned error: ${result.error}`);
+    } else {
+      assertEq(result.diff, "-2|l2\n-5|l5\n-8|l8", "buildStreamingSectionDiff: multiple ops natural order (ascending)");
+      assertEq(result.firstChangedLine, 2, "buildStreamingSectionDiff: multiple ops firstChangedLine is first anchor");
+    }
+  }
+
+  // 7. No changes
+  {
+    const result = await buildStreamingSectionDiff([], "line1", "/tmp/file.unknown");
+    if ("error" in result) {
+      assertEq(result.error, "No changes would be made.", "buildStreamingSectionDiff: empty edits returns error");
+    } else {
+      assert(false, `buildStreamingSectionDiff: empty edits should return error, got: ${result.diff}`);
+    }
+  }
+
+  // 8. Block op dropping (unsupported extension → dropped, not thrown)
+  {
+    const edits: EditOp[] = [{ kind: "block", anchor: 1, lines: ["x"], blockOp: "swap" }];
+    const text = "line1\nline2";
+    let threw = false;
+    try {
+      const result = await buildStreamingSectionDiff(edits, text, "/tmp/file.unknown");
+      // Either resolves to a real diff (tree-sitter) or returns the empty-changes error
+      // — both are acceptable; the point is it did NOT throw.
+      if ("error" in result) {
+        assert(result.error === "No changes would be made.", "buildStreamingSectionDiff: dropped block returns no-changes error");
+      } else {
+        assert(typeof result.diff === "string", "buildStreamingSectionDiff: dropped/resolved block returns string diff");
+      }
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "buildStreamingSectionDiff: block drop should not throw");
+  }
+
+  // resolveBlockEdits default behavior preserved
+  {
+    const edits: EditOp[] = [{ kind: "block", anchor: 1, lines: ["x"], blockOp: "swap" }];
+    let threw = false;
+    try { await resolveBlockEdits(edits, "line1", "/tmp/file.unknown"); } catch { threw = true; }
+    assert(threw, "resolveBlockEdits: default (no options) still throws for unresolved SWAP.BLK");
+  }
+
+  // resolveBlockEdits onUnresolved: "drop" doesn't throw
+  {
+    const edits: EditOp[] = [{ kind: "block", anchor: 1, lines: ["x"], blockOp: "swap" }];
+    const dropResult = await resolveBlockEdits(edits, "line1\nline2", "/tmp/file.unknown", { onUnresolved: "drop" });
+    assertEq(dropResult.warnings.length, 1, "resolveBlockEdits: drop mode → 1 warning");
+    assert(dropResult.warnings[0]!.includes("SWAP.BLK 1"), "resolveBlockEdits: drop mode warning contains SWAP.BLK 1");
+    assert(dropResult.warnings[0]!.includes("Skipped"), "resolveBlockEdits: drop mode warning contains 'Skipped'");
+    assertEq(dropResult.edits.length, 0, "resolveBlockEdits: drop mode → 0 edits (block was dropped)");
+  }
+
+  // resolveBlockEdits onUnresolved: "drop" for DEL.BLK
+  {
+    const edits: EditOp[] = [{ kind: "block", anchor: 1, lines: [], blockOp: "delete" }];
+    const dropResult = await resolveBlockEdits(edits, "line1", "/tmp/file.unknown", { onUnresolved: "drop" });
+    assert(dropResult.warnings[0]!.includes("DEL.BLK 1"), "resolveBlockEdits: drop mode DEL.BLK warning contains anchor");
+    assertEq(dropResult.edits.length, 0, "resolveBlockEdits: drop mode DEL.BLK → 0 edits");
+  }
+
+  // resolveBlockEdits onUnresolved: "drop" + insert_after keeps lower behavior
+  {
+    const edits: EditOp[] = [{ kind: "block", anchor: 1, lines: ["y"], blockOp: "insert_after" }];
+    const dropResult = await resolveBlockEdits(edits, "line1\nline2", "/tmp/file.unknown", { onUnresolved: "drop" });
+    assertEq(dropResult.edits.length, 1, "resolveBlockEdits: drop mode insert_after → 1 edit (lowered)");
+    const loweredEdit = dropResult.edits[0]!;
+    if (loweredEdit.kind === "insert") {
+      assertEq(loweredEdit.position, "after", "resolveBlockEdits: drop mode insert_after lowered position");
+      assertEq(loweredEdit.anchor, 1, "resolveBlockEdits: drop mode insert_after lowered anchor");
+    } else {
+      assert(false, "resolveBlockEdits: drop mode insert_after should lower to insert");
+    }
+  }
+
+  // applyPartialTo basic apply
+  {
+    const edits: EditOp[] = [{ kind: "swap", start: 1, end: 1, lines: ["new"] }];
+    const result = await applyPartialTo(edits, "old", "/tmp/file.unknown");
+    assertEq(result.text, "new", "applyPartialTo: basic swap applies");
+    assertEq(result.warnings.length, 0, "applyPartialTo: basic swap → no warnings");
+  }
+
+  // applyPartialTo: unresolved block dropped
+  {
+    const edits: EditOp[] = [{ kind: "block", anchor: 1, lines: [], blockOp: "delete" }];
+    const result = await applyPartialTo(edits, "line1\nline2", "/tmp/file.unknown");
+    assertEq(result.text, "line1\nline2", "applyPartialTo: dropped block leaves text unchanged");
+    assert(result.warnings.length > 0, "applyPartialTo: dropped block produces warning");
+    assert(result.warnings[0]!.includes("Skipped"), "applyPartialTo: dropped block warning contains 'Skipped'");
+  }
+
+  // applyPartialTo: insert applies through lowered
+  {
+    const edits: EditOp[] = [{ kind: "insert", position: "after", anchor: 1, lines: ["x"] }];
+    const result = await applyPartialTo(edits, "a\nb", "/tmp/file.unknown");
+    assertEq(result.text, "a\nx\nb", "applyPartialTo: insert after applies");
+    assertEq(result.warnings.length, 0, "applyPartialTo: insert after → no warnings");
+  }
+
+  // applyPartialTo: Python SWAP.BLK on resolvable function
+  {
+    const pySource = ["def greet(name):", "    msg = 'Hello'", "    print(msg)", ""].join("\n");
+    const pyPath = "/tmp/test_streaming_diff.py";
+    writeFileSync(pyPath, pySource);
+    const edits: EditOp[] = [
+      { kind: "block", anchor: 1, lines: ["def new_greet():", "    pass"], blockOp: "swap" },
+    ];
+    const result = await applyPartialTo(edits, pySource, pyPath);
+    assert(result.text.startsWith("def new_greet():"), "applyPartialTo: SWAP.BLK on Python function applies");
+    assert(!result.text.includes("def greet(name):"), "applyPartialTo: SWAP.BLK replaced original function");
+    assertEq(result.warnings.length, 0, "applyPartialTo: SWAP.BLK on Python function → no warnings");
+    try { rmSync(pyPath); } catch {}
+  }
+
+  // buildStreamingSectionDiff on Python SWAP.BLK
+  {
+    const pySource = ["def greet(name):", "    msg = 'Hello'", "    print(msg)", ""].join("\n");
+    const pyPath = "/tmp/test_streaming_diff2.py";
+    writeFileSync(pyPath, pySource);
+    const edits: EditOp[] = [
+      { kind: "block", anchor: 1, lines: ["def new_greet():", "    pass"], blockOp: "swap" },
+    ];
+    const result = await buildStreamingSectionDiff(edits, pySource, pyPath);
+    if ("error" in result) {
+      assert(false, `buildStreamingSectionDiff: Python SWAP.BLK should not error, got: ${result.error}`);
+    } else {
+      assert(result.diff.includes("-1|def greet(name):"), "buildStreamingSectionDiff: Python SWAP.BLK shows deletion row");
+      assert(result.diff.includes("+1|def new_greet():"), "buildStreamingSectionDiff: Python SWAP.BLK shows insertion row");
+      assertEq(result.firstChangedLine, 1, "buildStreamingSectionDiff: Python SWAP.BLK firstChangedLine");
+    }
+    try { rmSync(pyPath); } catch {}
+  }
+})();
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
