@@ -103,6 +103,627 @@ function computeFileHash(text: string): string {
   return low16.toString(16).padStart(HASH_LENGTH, "0").toUpperCase();
 }
 
+// ─── Tokenizer Constants ────────────────────────────────────────────────────
+
+const CHAR_LINE_FEED = 10;
+const CHAR_CARRIAGE_RETURN = 13;
+const CHAR_ZERO = 48;
+const CHAR_NINE = 57;
+const CHAR_HASH = 35;
+const CHAR_TAB = 9;
+const CHAR_SPACE = 32;
+const CHAR_DOT = 46;
+const CHAR_HYPHEN = 45;
+const CHAR_ELLIPSIS = 0x2026;
+const CHAR_EQUALS = 61;
+const CHAR_UPPER_A = 65;
+const CHAR_UPPER_F = 70;
+const CHAR_LOWER_A = 97;
+const CHAR_LOWER_F = 102;
+const CHAR_PAYLOAD_REPLACE = 43;
+const CHAR_COLON = 58;
+const CHAR_BRACKET_OPEN = 91;
+const CHAR_BRACKET_CLOSE = 93;
+
+const BEGIN_PATCH_MARKER = "*** Begin Patch";
+const END_PATCH_MARKER = "*** End Patch";
+const ABORT_MARKER = "*** Abort";
+
+const BARE_BODY_AUTO_PIPED_WARNING = "Auto-prefixed bare body row(s) with `+`. Body rows must be `+TEXT` literal lines.";
+const MINUS_ROW_REJECTED = "`-` rows are not valid; the range already names the lines being changed. For a literal `-` line, write `+-…`.";
+const EMPTY_BLOCK_MSG = "`SWAP.BLK N:` needs at least one `+TEXT` body row. To delete a block, use `DEL.BLK N`.";
+const EMPTY_INSERT_MSG = "`INS` needs at least one `+TEXT` body row.";
+const DELETE_TAKES_NO_BODY_MSG = "`DEL N.=M` does not take body rows. Remove the body, or use `SWAP N.=M:`.";
+const DELETE_BLOCK_TAKES_NO_BODY_MSG = "`DEL.BLK N` does not take body rows. Remove the body, or use `SWAP.BLK N:`.";
+const EMPTY_REPLACE_MSG = "`SWAP N.=M:` needs at least one `+TEXT` body row. To delete lines, use `DEL N.=M`.";
+
+const BARE_LITERAL_VALUE_RE = /^\s*(?:"[^"]*"|'[^']*'|[-+]?\d+(?:\.\d+)?)\s*,?\s*$/;
+
+function isDigitCode(code: number): boolean { return code >= CHAR_ZERO && code <= CHAR_NINE; }
+function isNonZeroDigitCode(code: number): boolean { return code > CHAR_ZERO && code <= CHAR_NINE; }
+function isHexDigitCode(code: number): boolean {
+  return isDigitCode(code) || (code >= CHAR_UPPER_A && code <= CHAR_UPPER_F) || (code >= CHAR_LOWER_A && code <= CHAR_LOWER_F);
+}
+function isWhitespaceCode(code: number): boolean {
+  return code === CHAR_SPACE || (code >= CHAR_TAB && code <= CHAR_CARRIAGE_RETURN);
+}
+function skipWhitespace(line: string, index: number, end = line.length): number {
+  while (index < end && isWhitespaceCode(line.charCodeAt(index))) index++;
+  return index;
+}
+function trimEndIndex(line: string): number {
+  let end = line.length;
+  while (end > 0 && isWhitespaceCode(line.charCodeAt(end - 1))) end--;
+  return end;
+}
+function isEmptyLine(line: string): boolean { return line.length === 0; }
+function markerLineEquals(line: string, marker: string): boolean {
+  const end = trimEndIndex(line);
+  return end === marker.length && line.startsWith(marker);
+}
+
+export function splitHashlineLines(text: string): string[] {
+  if (text.length === 0) return [""];
+  const lines: string[] = [];
+  let start = 0;
+  for (let index = 0; index < text.length; index++) {
+    if (text.charCodeAt(index) !== CHAR_LINE_FEED) continue;
+    let end = index;
+    if (end > start && text.charCodeAt(end - 1) === CHAR_CARRIAGE_RETURN) end--;
+    lines.push(text.slice(start, end));
+    start = index + 1;
+  }
+  if (start < text.length) {
+    let end = text.length;
+    if (end > start && text.charCodeAt(end - 1) === CHAR_CARRIAGE_RETURN) end--;
+    lines.push(text.slice(start, end));
+  }
+  return lines;
+}
+
+// ─── Tokenizer Scanning ─────────────────────────────────────────────────────
+
+interface Anchor { line: number; }
+interface ParsedRange { start: Anchor; end: Anchor; }
+interface NumberScan { line: number; nextIndex: number; }
+interface RangeScan { range: ParsedRange; nextIndex: number; }
+
+type BlockTarget =
+  | { kind: "replace"; range: ParsedRange }
+  | { kind: "block"; anchor: Anchor }
+  | { kind: "delete"; range: ParsedRange }
+  | { kind: "delete_block"; anchor: Anchor }
+  | { kind: "insert_before"; anchor: Anchor }
+  | { kind: "insert_after"; anchor: Anchor }
+  | { kind: "insert_after_block"; anchor: Anchor }
+  | { kind: "bof" }
+  | { kind: "eof" };
+
+interface TargetScan { target: BlockTarget; nextIndex: number; }
+interface ParsedHunkHeader { target: BlockTarget; }
+
+function scanLineNumber(line: string, index: number, end: number): NumberScan | null {
+  if (index >= end || !isNonZeroDigitCode(line.charCodeAt(index))) return null;
+  let lineNumber = 0;
+  let nextIndex = index;
+  while (nextIndex < end) {
+    const code = line.charCodeAt(nextIndex);
+    if (!isDigitCode(code)) break;
+    lineNumber = lineNumber * 10 + (code - CHAR_ZERO);
+    nextIndex++;
+  }
+  return { line: lineNumber, nextIndex };
+}
+
+function scanRangeSeparator(line: string, index: number, end: number): number | null {
+  let cursor = index;
+  let consumedSeparator = false;
+  while (cursor < end) {
+    const code = line.charCodeAt(cursor);
+    if (isWhitespaceCode(code) || code === CHAR_HYPHEN || code === CHAR_ELLIPSIS || code === CHAR_DOT || code === CHAR_EQUALS) {
+      cursor++;
+      consumedSeparator = true;
+      continue;
+    }
+    break;
+  }
+  if (!consumedSeparator) return null;
+  if (cursor >= end || !isNonZeroDigitCode(line.charCodeAt(cursor))) return null;
+  return cursor;
+}
+
+function scanHeaderRange(line: string, index = 0, end = trimEndIndex(line), allowSingle = false): RangeScan | null {
+  const numberStart = skipWhitespace(line, index, end);
+  const start = scanLineNumber(line, numberStart, end);
+  if (start === null) return null;
+  const afterFirst = scanRangeSeparator(line, start.nextIndex, end);
+  if (afterFirst === null) {
+    if (!allowSingle) return null;
+    return {
+      range: { start: { line: start.line }, end: { line: start.line } },
+      nextIndex: skipWhitespace(line, start.nextIndex, end),
+    };
+  }
+  const endNumber = scanLineNumber(line, afterFirst, end);
+  if (endNumber === null) return null;
+  return {
+    range: { start: { line: start.line }, end: { line: endNumber.line } },
+    nextIndex: skipWhitespace(line, endNumber.nextIndex, end),
+  };
+}
+
+function scanKeyword(line: string, index: number, end: number, keyword: string): number | null {
+  if (!line.startsWith(keyword, index)) return null;
+  const next = index + keyword.length;
+  if (next < end) {
+    const code = line.charCodeAt(next);
+    if (!isWhitespaceCode(code) && code !== CHAR_COLON && code !== CHAR_DOT) return null;
+  }
+  return next;
+}
+
+function consumeOptionalColon(line: string, index: number, end: number): number {
+  const cursor = skipWhitespace(line, index, end);
+  return cursor < end && line.charCodeAt(cursor) === CHAR_COLON ? skipWhitespace(line, cursor + 1, end) : cursor;
+}
+
+function scanInsertTarget(line: string, index: number, end: number): TargetScan | null {
+  if (index >= end || line.charCodeAt(index) !== CHAR_DOT) return null;
+  const cursor = skipWhitespace(line, index + 1, end);
+  const beforeEnd = scanKeyword(line, cursor, end, "PRE");
+  if (beforeEnd !== null) {
+    const anchor = scanLineNumber(line, skipWhitespace(line, beforeEnd, end), end);
+    if (anchor === null) return null;
+    return { target: { kind: "insert_before", anchor: { line: anchor.line } }, nextIndex: consumeOptionalColon(line, anchor.nextIndex, end) };
+  }
+  const afterEnd = scanKeyword(line, cursor, end, "POST");
+  if (afterEnd !== null) {
+    const anchor = scanLineNumber(line, skipWhitespace(line, afterEnd, end), end);
+    if (anchor === null) return null;
+    return { target: { kind: "insert_after", anchor: { line: anchor.line } }, nextIndex: consumeOptionalColon(line, anchor.nextIndex, end) };
+  }
+  const headEnd = scanKeyword(line, cursor, end, "HEAD");
+  if (headEnd !== null) return { target: { kind: "bof" }, nextIndex: consumeOptionalColon(line, headEnd, end) };
+  const tailEnd = scanKeyword(line, cursor, end, "TAIL");
+  if (tailEnd !== null) return { target: { kind: "eof" }, nextIndex: consumeOptionalColon(line, tailEnd, end) };
+  return null;
+}
+
+function scanHunkAnchor(line: string, start: number, end: number): TargetScan | null {
+  const cursor = skipWhitespace(line, start, end);
+  const replaceBlockEnd = scanKeyword(line, cursor, end, "SWAP.BLK");
+  if (replaceBlockEnd !== null) {
+    const anchor = scanLineNumber(line, skipWhitespace(line, replaceBlockEnd, end), end);
+    if (anchor === null) return null;
+    return { target: { kind: "block", anchor: { line: anchor.line } }, nextIndex: consumeOptionalColon(line, anchor.nextIndex, end) };
+  }
+  const replaceEnd = scanKeyword(line, cursor, end, "SWAP");
+  if (replaceEnd !== null) {
+    const range = scanHeaderRange(line, replaceEnd, end, true);
+    if (range === null) return null;
+    return { target: { kind: "replace", range: range.range }, nextIndex: consumeOptionalColon(line, range.nextIndex, end) };
+  }
+  const deleteBlockEnd = scanKeyword(line, cursor, end, "DEL.BLK");
+  if (deleteBlockEnd !== null) {
+    const anchor = scanLineNumber(line, skipWhitespace(line, deleteBlockEnd, end), end);
+    if (anchor === null) return null;
+    const next = skipWhitespace(line, anchor.nextIndex, end);
+    if (next < end && line.charCodeAt(next) === CHAR_COLON) return null;
+    return { target: { kind: "delete_block", anchor: { line: anchor.line } }, nextIndex: next };
+  }
+  const deleteEnd = scanKeyword(line, cursor, end, "DEL");
+  if (deleteEnd !== null) {
+    const range = scanHeaderRange(line, deleteEnd, end, true);
+    if (range === null) return null;
+    const next = skipWhitespace(line, range.nextIndex, end);
+    if (next < end && line.charCodeAt(next) === CHAR_COLON) return null;
+    return { target: { kind: "delete", range: range.range }, nextIndex: next };
+  }
+  const insertAfterBlockEnd = scanKeyword(line, cursor, end, "INS.BLK.POST");
+  if (insertAfterBlockEnd !== null) {
+    const anchor = scanLineNumber(line, skipWhitespace(line, insertAfterBlockEnd, end), end);
+    if (anchor === null) return null;
+    return { target: { kind: "insert_after_block", anchor: { line: anchor.line } }, nextIndex: consumeOptionalColon(line, anchor.nextIndex, end) };
+  }
+  const insertEnd = scanKeyword(line, cursor, end, "INS");
+  if (insertEnd !== null) return scanInsertTarget(line, insertEnd, end);
+  return null;
+}
+
+function tryParseHunkHeader(line: string): ParsedHunkHeader | null {
+  const end = trimEndIndex(line);
+  const start = skipWhitespace(line, 0, end);
+  if (start >= end) return null;
+  const scan = scanHunkAnchor(line, start, end);
+  if (scan === null) return null;
+  if (scan.nextIndex !== end) return null;
+  return { target: scan.target };
+}
+
+function tryParseTokenizerHeader(line: string): { path: string; fileHash: string } | null {
+  if (line.charCodeAt(0) !== CHAR_BRACKET_OPEN) return null;
+  const end = trimEndIndex(line);
+  if (end < 3 || line.charCodeAt(end - 1) !== CHAR_BRACKET_CLOSE) return null;
+  const bodyEnd = end - 1;
+  if (bodyEnd <= 1) return null;
+  const trailingHashStart = bodyEnd - 5;
+  if (trailingHashStart < 1 || line.charCodeAt(trailingHashStart) !== CHAR_HASH) return null;
+  let allHex = true;
+  for (let probe = trailingHashStart + 1; probe < bodyEnd; probe++) {
+    if (!isHexDigitCode(line.charCodeAt(probe))) { allHex = false; break; }
+  }
+  if (!allHex) return null;
+  const pathEnd = trailingHashStart;
+  for (let i = 1; i < pathEnd; i++) {
+    if (line.charCodeAt(i) === CHAR_HASH) return null;
+  }
+  if (pathEnd <= 1) return null;
+  const pathText = stripApplyPatchPathNoise(line.slice(1, pathEnd));
+  if (pathText.length === 0) return null;
+  const fileHash = line.slice(trailingHashStart + 1, bodyEnd).toUpperCase();
+  return { path: pathText, fileHash };
+}
+
+// ─── Tokenizer ──────────────────────────────────────────────────────────────
+
+type Token =
+  | { kind: "blank"; lineNum: number }
+  | { kind: "envelope-begin"; lineNum: number }
+  | { kind: "envelope-end"; lineNum: number }
+  | { kind: "abort"; lineNum: number }
+  | { kind: "header"; lineNum: number; path: string; fileHash: string }
+  | { kind: "op-block"; lineNum: number; target: BlockTarget }
+  | { kind: "payload-literal"; lineNum: number; text: string }
+  | { kind: "raw"; lineNum: number; text: string };
+
+function classifyLine(line: string, lineNum: number): Token {
+  if (isEmptyLine(line)) return { kind: "blank", lineNum };
+  if (markerLineEquals(line, BEGIN_PATCH_MARKER)) return { kind: "envelope-begin", lineNum };
+  if (markerLineEquals(line, END_PATCH_MARKER)) return { kind: "envelope-end", lineNum };
+  if (markerLineEquals(line, ABORT_MARKER)) return { kind: "abort", lineNum };
+  if (line.charCodeAt(0) === CHAR_BRACKET_OPEN) {
+    const header = tryParseTokenizerHeader(line);
+    if (header !== null) {
+      return { kind: "header", lineNum, path: header.path, fileHash: header.fileHash };
+    }
+    if (line.charCodeAt(line.length - 1) === CHAR_BRACKET_CLOSE) {
+      const recovered = tryParseRecoveryHeader(line);
+      if (recovered !== null) {
+        return { kind: "header", lineNum, path: recovered.path, fileHash: recovered.hash };
+      }
+    }
+  }
+  const lead = skipWhitespace(line, 0);
+  const isHunkLead =
+    line.startsWith("SWAP", lead) ||
+    line.startsWith("DEL", lead) ||
+    line.startsWith("INS", lead);
+  if (isHunkLead) {
+    const hunk = tryParseHunkHeader(line);
+    if (hunk !== null) return { kind: "op-block", lineNum, target: hunk.target };
+  }
+  if (line.charCodeAt(0) === CHAR_PAYLOAD_REPLACE) {
+    return { kind: "payload-literal", lineNum, text: line.slice(1) };
+  }
+  return { kind: "raw", lineNum, text: line };
+}
+
+export class Tokenizer {
+  #buffer = "";
+  #nextLineNum = 1;
+  #closed = false;
+
+  feed(chunk: string): Token[] {
+    if (this.#closed) throw new Error("Tokenizer is closed; call reset() before reusing.");
+    if (chunk.length === 0) return [];
+    this.#buffer = this.#buffer ? this.#buffer + chunk : chunk;
+    return this.#drainCompleteLines();
+  }
+
+  end(): Token[] {
+    if (this.#closed) return [];
+    this.#closed = true;
+    const buf = this.#buffer;
+    this.#buffer = "";
+    if (buf.length === 0) return [];
+    let stop = buf.length;
+    if (buf.charCodeAt(stop - 1) === CHAR_CARRIAGE_RETURN) stop--;
+    return [classifyLine(buf.slice(0, stop), this.#nextLineNum++)];
+  }
+
+  reset(): void {
+    this.#buffer = "";
+    this.#nextLineNum = 1;
+    this.#closed = false;
+  }
+
+  tokenizeAll(text: string): Token[] {
+    this.reset();
+    const first = this.feed(text);
+    const last = this.end();
+    return last.length === 0 ? first : first.concat(last);
+  }
+
+  tokenize(line: string, lineNum = 0): Token {
+    return classifyLine(line, lineNum);
+  }
+
+  isOp(line: string): boolean {
+    return tryParseHunkHeader(line) !== null;
+  }
+
+  isHeader(line: string): boolean {
+    return tryParseTokenizerHeader(line) !== null || tryParseRecoveryHeader(line) !== null;
+  }
+
+  isEnvelopeMarker(line: string): boolean {
+    return markerLineEquals(line, BEGIN_PATCH_MARKER) || markerLineEquals(line, END_PATCH_MARKER) || markerLineEquals(line, ABORT_MARKER);
+  }
+
+  #drainCompleteLines(): Token[] {
+    const tokens: Token[] = [];
+    const buf = this.#buffer;
+    let start = 0;
+    for (let index = 0; index < buf.length; index++) {
+      if (buf.charCodeAt(index) !== CHAR_LINE_FEED) continue;
+      let stop = index;
+      if (stop > start && buf.charCodeAt(stop - 1) === CHAR_CARRIAGE_RETURN) stop--;
+      tokens.push(classifyLine(buf.slice(start, stop), this.#nextLineNum++));
+      start = index + 1;
+    }
+    this.#buffer = start < buf.length ? buf.slice(start) : "";
+    return tokens;
+  }
+}
+
+// ─── Executor ───────────────────────────────────────────────────────────────
+
+interface PayloadRow { text: string; lineNum: number; bare?: boolean; }
+
+interface Pending {
+  target: BlockTarget;
+  lineNum: number;
+  payloads: PayloadRow[];
+  deferredBlanks: PayloadRow[];
+}
+
+interface PendingComment {
+  lineNum: number;
+  text: string;
+}
+
+function validateRangeOrder(range: ParsedRange, lineNum: number): void {
+  if (range.end.line < range.start.line) {
+    throw new Error(`line ${lineNum}: range ${range.start.line}.=${range.end.line} ends before it starts.`);
+  }
+}
+
+function isSkippableCommentLine(line: string): boolean {
+  return line.trimStart().startsWith("#");
+}
+
+export class Executor {
+  #sections: PatchSection[] = [];
+  #currentSection: PatchSection | null = null;
+  #warnings: string[] = [];
+  #pending: Pending | undefined;
+  #terminated = false;
+  #skippableComments: PendingComment[] = [];
+
+  #discardPendingSkippableComments(): void {
+    this.#skippableComments = [];
+  }
+
+  #consumePendingSkippableComments(): void {
+    this.#skippableComments = [];
+  }
+
+  feed(token: Token): void {
+    if (this.#terminated) return;
+    switch (token.kind) {
+      case "envelope-begin":
+        this.#consumePendingSkippableComments();
+        return;
+      case "envelope-end":
+        this.#consumePendingSkippableComments();
+        this.#terminated = true;
+        return;
+      case "abort":
+        this.#terminated = true;
+        return;
+      case "header":
+        this.#consumePendingSkippableComments();
+        this.#flushPending();
+        this.#currentSection = { path: token.path, hash: token.fileHash, edits: [] };
+        this.#sections.push(this.#currentSection);
+        return;
+      case "blank":
+        this.#consumePendingSkippableComments();
+        this.#handleBlank("", token.lineNum);
+        return;
+      case "payload-literal":
+        this.#consumePendingSkippableComments();
+        this.#handleLiteralPayload(token.text, token.lineNum);
+        return;
+      case "raw":
+        if (this.#pending === undefined && this.#currentSection !== null && isSkippableCommentLine(token.text)) {
+          this.#skippableComments.push({ text: token.text, lineNum: token.lineNum });
+          return;
+        }
+        this.#consumePendingSkippableComments();
+        this.#handleRaw(token.text, token.lineNum);
+        return;
+      case "op-block":
+        this.#discardPendingSkippableComments();
+        if (token.target.kind === "replace" || token.target.kind === "delete") {
+          validateRangeOrder(token.target.range, token.lineNum);
+        }
+        this.#flushPending();
+        this.#pending = { target: token.target, lineNum: token.lineNum, payloads: [], deferredBlanks: [] };
+        return;
+    }
+  }
+
+  end(): { sections: PatchSection[]; warnings: string[] } {
+    this.#consumePendingSkippableComments();
+    this.#flushPending();
+    this.#validateNoOverlappingDeletes();
+    return { sections: this.#sections, warnings: this.#warnings };
+  }
+
+  endStreaming(): { sections: PatchSection[]; warnings: string[] } {
+    this.#consumePendingSkippableComments();
+    if (this.#pending && this.#pending.payloads.length > 0) this.#flushPending();
+    else if (this.#pending?.target.kind === "delete" || this.#pending?.target.kind === "delete_block") this.#flushPending();
+    else this.#pending = undefined;
+    this.#validateNoOverlappingDeletes();
+    return { sections: this.#sections, warnings: this.#warnings };
+  }
+
+  reset(): void {
+    this.#sections = [];
+    this.#currentSection = null;
+    this.#warnings = [];
+    this.#pending = undefined;
+    this.#skippableComments = [];
+    this.#terminated = false;
+  }
+
+  #validateNoOverlappingDeletes(): void {
+    const deleteCountByStart = new Map<number, number>();
+    for (const section of this.#sections) {
+      for (const edit of section.edits) {
+        if (edit.kind !== "delete") continue;
+        const count = deleteCountByStart.get(edit.start);
+        deleteCountByStart.set(edit.start, (count ?? 0) + 1);
+      }
+    }
+    for (const [anchorLine, count] of deleteCountByStart) {
+      if (count < 2) continue;
+      throw new Error(
+        `anchor line ${anchorLine} is already targeted by another delete hunk. ` +
+        "Issue ONE hunk per range; payload is only the final desired content, never a before/after pair.",
+      );
+    }
+  }
+
+  #handleLiteralPayload(text: string, lineNum: number): void {
+    const pending = this.#pending;
+    if (!pending) {
+      throw new Error(`line ${lineNum}: payload line has no preceding hunk header. Got ${JSON.stringify(`+${text}`)}.`);
+    }
+    if (pending.target.kind === "delete") throw new Error(`line ${lineNum}: ${DELETE_TAKES_NO_BODY_MSG}`);
+    if (pending.target.kind === "delete_block") throw new Error(`line ${lineNum}: ${DELETE_BLOCK_TAKES_NO_BODY_MSG}`);
+    this.#commitDeferredBlanks(pending);
+    pending.payloads.push({ text, lineNum });
+  }
+
+  #handleRaw(text: string, lineNum: number): void {
+    const contamination = detectContamination(text);
+    if (contamination !== null) throw new Error(`line ${lineNum}: ${contamination}`);
+    if (this.#pending) {
+      if (text.trim().length === 0) {
+        this.#handleBlank(text, lineNum);
+        return;
+      }
+      if (this.#pending.target.kind === "delete") throw new Error(`line ${lineNum}: ${DELETE_TAKES_NO_BODY_MSG}`);
+      if (this.#pending.target.kind === "delete_block") throw new Error(`line ${lineNum}: ${DELETE_BLOCK_TAKES_NO_BODY_MSG}`);
+      if (text.trimStart().charCodeAt(0) === 45) throw new Error(`line ${lineNum}: ${MINUS_ROW_REJECTED}`);
+      if (!this.#warnings.includes(BARE_BODY_AUTO_PIPED_WARNING)) this.#warnings.push(BARE_BODY_AUTO_PIPED_WARNING);
+      this.#commitDeferredBlanks(this.#pending);
+      this.#pending.payloads.push({ text, lineNum, bare: true });
+      return;
+    }
+    if (text.trim().length === 0) return;
+    if (this.#currentSection === null) return;
+    throw new Error(
+      `line ${lineNum}: payload line has no preceding hunk header. ` +
+      `Use \`SWAP N.=M:\`, \`DEL N.=M\`, or \`INS.PRE|POST|HEAD|TAIL:\` above the body. Got ${JSON.stringify(text)}.`,
+    );
+  }
+
+  #handleBlank(text: string, lineNum: number): void {
+    const pending = this.#pending;
+    if (!pending) return;
+    if (pending.target.kind === "delete" || pending.target.kind === "delete_block") return;
+    if (pending.payloads.length === 0) return;
+    pending.deferredBlanks.push({ text, lineNum, bare: true });
+  }
+
+  #commitDeferredBlanks(pending: Pending): void {
+    if (pending.deferredBlanks.length === 0) return;
+    if (!this.#warnings.includes(BARE_BODY_AUTO_PIPED_WARNING)) this.#warnings.push(BARE_BODY_AUTO_PIPED_WARNING);
+    pending.payloads.push(...pending.deferredBlanks);
+    pending.deferredBlanks = [];
+  }
+
+  #stripBarePrefixesIfUniform(payloads: PayloadRow[]): void {
+    let sawBare = false;
+    let allLiteralValues = true;
+    for (const row of payloads) {
+      if (!row.bare || row.text.trim().length === 0) continue;
+      sawBare = true;
+      const stripped = stripLeadingHashlinePrefix(row.text);
+      if (stripped === row.text) return;
+      allLiteralValues = allLiteralValues && BARE_LITERAL_VALUE_RE.test(stripped);
+    }
+    if (!sawBare) return;
+    if (allLiteralValues) return;
+    for (const row of payloads) {
+      if (row.bare && row.text.trim().length > 0) row.text = stripLeadingHashlinePrefix(row.text);
+    }
+  }
+
+  #flushPending(): void {
+    const pending = this.#pending;
+    if (!pending) return;
+    const { target, lineNum, payloads } = pending;
+    this.#stripBarePrefixesIfUniform(payloads);
+    this.#pending = undefined;
+    const section = this.#currentSection;
+    if (!section) return;
+    if (target.kind === "delete") {
+      section.edits.push({ kind: "delete", start: target.range.start.line, end: target.range.end.line });
+      return;
+    }
+    if (target.kind === "delete_block") {
+      section.edits.push({ kind: "block", anchor: target.anchor.line, lines: [], blockOp: "delete" });
+      return;
+    }
+    if (target.kind === "block") {
+      if (payloads.length === 0) throw new Error(`line ${lineNum}: ${EMPTY_BLOCK_MSG}`);
+      section.edits.push({ kind: "block", anchor: target.anchor.line, lines: payloads.map(p => p.text), blockOp: "swap" });
+      return;
+    }
+    if (target.kind === "insert_after_block") {
+      if (payloads.length === 0) throw new Error(`line ${lineNum}: ${EMPTY_INSERT_MSG}`);
+      section.edits.push({ kind: "block", anchor: target.anchor.line, lines: payloads.map(p => p.text), blockOp: "insert_after" });
+      return;
+    }
+    if (payloads.length === 0) {
+      if (target.kind === "replace") {
+        throw new Error(`line ${lineNum}: ${EMPTY_REPLACE_MSG}`);
+      }
+      throw new Error(`line ${lineNum}: ${EMPTY_INSERT_MSG}`);
+    }
+    const lines = payloads.map(p => p.text);
+    if (target.kind === "replace") {
+      section.edits.push({ kind: "swap", start: target.range.start.line, end: target.range.end.line, lines });
+      return;
+    }
+    if (target.kind === "insert_before") {
+      section.edits.push({ kind: "insert", position: "before", anchor: target.anchor.line, lines });
+      return;
+    }
+    if (target.kind === "insert_after") {
+      section.edits.push({ kind: "insert", position: "after", anchor: target.anchor.line, lines });
+      return;
+    }
+    const cursor = target.kind === "bof" ? "head" : "tail";
+    section.edits.push({ kind: "insert", position: cursor, anchor: 0, lines });
+  }
+}
+
 // ─── Snapshot Store ──────────────────────────────────────────────────────────
 
 const MAX_PATHS = 30;
@@ -481,166 +1102,36 @@ function detectContamination(text: string): string | null {
     const preview = trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed;
     return `\`@@\`-bracketed hunk header ${JSON.stringify(preview)} is not valid in hashline. Drop the \`@@ ... @@\` brackets and write a verb header such as \`SWAP N.=M:\`.`;
   }
+  if (/^DEL\s+[1-9]\d*(?:\s*(?:\.\.|\.=|-|…|\s)\s*[1-9]\d*)?\s*:/.test(trimmed)) {
+    return "`DEL N.=M` has no colon and no body. Remove the colon and body rows.";
+  }
+  if (/^[1-9]\d*\s*$/.test(trimmed)) {
+    return `hunk headers need a verb. Use \`SWAP ${trimmed}.=${trimmed}:\` to replace, or \`DEL ${trimmed}\` to delete.`;
+  }
+  const bareRange = /^([1-9]\d*)\s*[-. …=]+\s*([1-9]\d*)\s*:?$/.exec(trimmed);
+  if (bareRange !== null) {
+    return (
+      `bare range hunk header ${JSON.stringify(trimmed)} is not valid. ` +
+      `Hunk headers need a verb: write \`SWAP ${bareRange[1]}.=${bareRange[2]}:\` or \`DEL ${bareRange[1]}.=${bareRange[2]}\`.`
+    );
+  }
   return null;
 }
 
 function parsePatch(input: string): PatchSection[] {
-  const sections: PatchSection[] = [];
-  const lines = input.split("\n");
+  const tokenizer = new Tokenizer();
+  const executor = new Executor();
+  for (const token of tokenizer.feed(input)) executor.feed(token);
+  for (const token of tokenizer.end()) executor.feed(token);
+  return executor.end().sections;
+}
 
-  let currentSection: PatchSection | null = null;
-  let bodyTarget: string[] | null = null;
-
-  for (const line of lines) {
-    if (line.startsWith("*** Begin Patch") || line.startsWith("*** End Patch")) continue;
-    if (line.startsWith("*** Abort")) break;
-
-    const headerMatch = line.match(/^\[([^\]]+)#([0-9A-Fa-f]{4})\]\s*$/);
-    if (headerMatch) {
-      bodyTarget = null;
-      if (currentSection) sections.push(currentSection);
-      currentSection = {
-        path: stripApplyPatchPathNoise(headerMatch[1]!),
-        hash: headerMatch[2]!.toUpperCase(),
-        edits: [],
-      };
-      continue;
-    }
-
-    if (line.startsWith("[") && line.endsWith("]")) {
-      const recovered = tryParseRecoveryHeader(line);
-      if (recovered) {
-        bodyTarget = null;
-        if (currentSection) sections.push(currentSection);
-        currentSection = {
-          path: recovered.path,
-          hash: recovered.hash,
-          edits: [],
-        };
-        continue;
-      }
-    }
-
-    if (!currentSection) continue;
-
-    if (bodyTarget !== null && line.startsWith("+")) {
-      bodyTarget.push(line.slice(1));
-      continue;
-    }
-
-    if (bodyTarget !== null && line.startsWith("-")) {
-      throw new Error("`-` rows are not valid; the range already names the lines being changed. For a literal `-` line, write `+-…`.");
-    }
-
-    bodyTarget = null;
-
-    const swapMatch = line.match(/^SWAP\s+(\d+)\s*[-.=…]+\s*(\d+):\s*$/);
-    const delMatch = line.match(/^DEL\s+(\d+)\s*(?:[-.=…]+\s*(\d+))?\s*$/);
-    const insPreMatch = line.match(/^INS\.PRE\s+(\d+):\s*$/);
-    const insPostMatch = line.match(/^INS\.POST\s+(\d+):\s*$/);
-    const insHeadMatch = line.match(/^INS\.HEAD:\s*$/);
-    const insTailMatch = line.match(/^INS\.TAIL:\s*$/);
-    const swapBlkMatch = line.match(/^SWAP\.BLK\s+(\d+):\s*$/);
-    const delBlkMatch = line.match(/^DEL\.BLK\s+(\d+)\s*$/);
-    const insBlkPostMatch = line.match(/^INS\.BLK\.POST\s+(\d+):\s*$/);
-
-    if (swapMatch) {
-      const edit: Extract<EditOp, { kind: "swap" }> = {
-        kind: "swap",
-        start: parseInt(swapMatch[1]!, 10),
-        end: parseInt(swapMatch[2]!, 10),
-        lines: [],
-      };
-      currentSection.edits.push(edit);
-      bodyTarget = edit.lines;
-    } else if (delMatch) {
-      const start = parseInt(delMatch[1]!, 10);
-      const end = delMatch[2] ? parseInt(delMatch[2]!, 10) : start;
-      currentSection.edits.push({ kind: "delete", start, end });
-    } else if (insPreMatch) {
-      const edit: Extract<EditOp, { kind: "insert" }> = {
-        kind: "insert",
-        position: "before",
-        anchor: parseInt(insPreMatch[1]!, 10),
-        lines: [],
-      };
-      currentSection.edits.push(edit);
-      bodyTarget = edit.lines;
-    } else if (insPostMatch) {
-      const edit: Extract<EditOp, { kind: "insert" }> = {
-        kind: "insert",
-        position: "after",
-        anchor: parseInt(insPostMatch[1]!, 10),
-        lines: [],
-      };
-      currentSection.edits.push(edit);
-      bodyTarget = edit.lines;
-    } else if (insHeadMatch) {
-      const edit: Extract<EditOp, { kind: "insert" }> = {
-        kind: "insert",
-        position: "head",
-        anchor: 0,
-        lines: [],
-      };
-      currentSection.edits.push(edit);
-      bodyTarget = edit.lines;
-    } else if (insTailMatch) {
-      const edit: Extract<EditOp, { kind: "insert" }> = {
-        kind: "insert",
-        position: "tail",
-        anchor: 0,
-        lines: [],
-      };
-      currentSection.edits.push(edit);
-      bodyTarget = edit.lines;
-    } else if (swapBlkMatch) {
-      const edit: Extract<EditOp, { kind: "block" }> = {
-        kind: "block",
-        anchor: parseInt(swapBlkMatch[1]!, 10),
-        lines: [],
-        blockOp: "swap",
-      };
-      currentSection.edits.push(edit);
-      bodyTarget = edit.lines;
-    } else if (delBlkMatch) {
-      currentSection.edits.push({
-        kind: "block",
-        anchor: parseInt(delBlkMatch[1]!, 10),
-        lines: [],
-        blockOp: "delete",
-      });
-      bodyTarget = null;
-    } else if (insBlkPostMatch) {
-      const edit: Extract<EditOp, { kind: "block" }> = {
-        kind: "block",
-        anchor: parseInt(insBlkPostMatch[1]!, 10),
-        lines: [],
-        blockOp: "insert_after",
-      };
-      currentSection.edits.push(edit);
-      bodyTarget = edit.lines;
-    } else {
-      const contamination = detectContamination(line);
-      if (contamination) {
-        throw new Error(contamination);
-      }
-    }
-  }
-
-  if (currentSection) sections.push(currentSection);
-
-  for (const section of sections) {
-    for (const edit of section.edits) {
-      if (edit.kind === "swap" && edit.lines.length === 0) {
-        throw new Error("`SWAP N.=M:` needs at least one `+TEXT` body row. To delete lines, use `DEL N.=M`.");
-      }
-      if (edit.kind === "block" && edit.blockOp === "swap" && edit.lines.length === 0) {
-        throw new Error("`SWAP.BLK N:` needs at least one `+TEXT` body row. To delete a block, use `DEL.BLK N`.");
-      }
-    }
-  }
-
-  return sections;
+function parsePatchStreaming(input: string): { sections: PatchSection[]; warnings: string[] } {
+  const tokenizer = new Tokenizer();
+  const executor = new Executor();
+  for (const token of tokenizer.feed(input)) executor.feed(token);
+  for (const token of tokenizer.end()) executor.feed(token);
+  return executor.endStreaming();
 }
 
 // ─── Edit Application ────────────────────────────────────────────────────────
@@ -2209,6 +2700,8 @@ export {
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
   parseGrepOutput,
   type GrepMatch, type GrepFileMatches, type ParsedGrepOutput,
+  parsePatchStreaming,
+  type Token, type BlockTarget, type ParsedRange, type Anchor,
 };
 export default HashlinePlugin;
 export { HashlinePlugin };

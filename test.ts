@@ -25,6 +25,8 @@ import {
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
   parseGrepOutput,
   type GrepMatch, type GrepFileMatches, type ParsedGrepOutput,
+  Tokenizer, Executor, parsePatchStreaming, splitHashlineLines,
+  type Token, type BlockTarget, type ParsedRange, type Anchor,
 } from "./src/index.ts";
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
@@ -2014,6 +2016,450 @@ console.log("\n─ Grep hashline mode ─");
       assert(!fallback.includes("#"), "unreadable: fallback has no tag");
     }
   }
+}
+
+// ── Test 58: Tokenizer ───────────────────────────────────────────────────────
+console.log("\n─ Tokenizer ─");
+
+{
+  const lines = splitHashlineLines("alpha\nbeta\ngamma");
+  assertEq(lines.length, 3, "splitHashlineLines: basic 3 lines");
+  assertEq(lines[0], "alpha", "splitHashlineLines: first line");
+  assertEq(lines[2], "gamma", "splitHashlineLines: last line");
+}
+
+{
+  const lines = splitHashlineLines("alpha\r\nbeta\r\ngamma");
+  assertEq(lines.length, 3, "splitHashlineLines: CRLF stripped");
+  assertEq(lines[0], "alpha", "splitHashlineLines: CRLF first");
+  assertEq(lines[1], "beta", "splitHashlineLines: CRLF second");
+}
+
+{
+  const lines = splitHashlineLines("alpha\rbeta");
+  assertEq(lines.length, 1, "splitHashlineLines: lone CR not a separator");
+  assertEq(lines[0], "alpha\rbeta", "splitHashlineLines: lone CR kept in content");
+}
+
+{
+  const lines = splitHashlineLines("");
+  assertEq(lines.length, 1, "splitHashlineLines: empty → single empty");
+  assertEq(lines[0], "", "splitHashlineLines: empty is empty string");
+}
+
+{
+  const lines = splitHashlineLines("alpha\n");
+  assertEq(lines.length, 1, "splitHashlineLines: trailing newline → 1 line");
+  assertEq(lines[0], "alpha", "splitHashlineLines: trailing newline content");
+}
+
+{
+  const tk = new Tokenizer();
+  const tokens = tk.feed("[foo.ts#1A2B]\nSWAP 1.=3:\n+new");
+  assertEq(tokens.length, 2, "Tokenizer.feed: 2 complete lines from 3-line chunk");
+  assertEq(tokens[0]?.kind, "header", "Tokenizer.feed: first token is header");
+  assertEq(tokens[1]?.kind, "op-block", "Tokenizer.feed: second token is op-block");
+  const rest = tk.end();
+  assertEq(rest.length, 1, "Tokenizer.end: flushes remaining");
+  assertEq(rest[0]?.kind, "payload-literal", "Tokenizer.end: remaining is payload-literal");
+}
+
+{
+  const tk = new Tokenizer();
+  const t1 = tk.feed("[foo.ts#1A2");
+  assertEq(t1.length, 0, "Tokenizer.feed: partial header buffered");
+  const t2 = tk.feed("B]\nSWAP 1.=1:");
+  assertEq(t2.length, 1, "Tokenizer.feed: completes across chunks");
+  assertEq(t2[0]?.kind, "header", "Tokenizer.feed: completed header kind");
+}
+
+{
+  const tk = new Tokenizer();
+  tk.feed("alpha\nbeta\n");
+  tk.end();
+  tk.reset();
+  const tokens = tk.feed("[x.ts#ABCD]\n");
+  assertEq(tokens.length, 1, "Tokenizer.reset: allows reuse");
+  assertEq(tokens[0]?.kind, "header", "Tokenizer.reset: works after reset");
+}
+
+{
+  const tk = new Tokenizer();
+  const tokens = tk.tokenizeAll("[foo.ts#1A2B]\nSWAP 1.=3:\n+new\nDEL 5\nINS.HEAD:\n+head\n*** Begin Patch\n*** End Patch\n*** Abort\n\nnot a header");
+  const kinds = tokens.map(t => t.kind);
+  assert(kinds.includes("header"), "classifyLine: header token");
+  assert(kinds.includes("op-block"), "classifyLine: op-block token");
+  assert(kinds.includes("payload-literal"), "classifyLine: payload-literal token");
+  assert(kinds.includes("envelope-begin"), "classifyLine: envelope-begin token");
+  assert(kinds.includes("envelope-end"), "classifyLine: envelope-end token");
+  assert(kinds.includes("abort"), "classifyLine: abort token");
+  assert(kinds.includes("blank"), "classifyLine: blank token");
+  assert(kinds.includes("raw"), "classifyLine: raw token");
+}
+
+{
+  const tk = new Tokenizer();
+  assert(tk.isOp("SWAP 1.=3:"), "Tokenizer.isOp: SWAP");
+  assert(tk.isOp("DEL 5"), "Tokenizer.isOp: DEL");
+  assert(tk.isOp("INS.HEAD:"), "Tokenizer.isOp: INS.HEAD");
+  assert(!tk.isOp("foo bar"), "Tokenizer.isOp: non-op");
+  assert(tk.isHeader("[foo.ts#1A2B]"), "Tokenizer.isHeader: valid header");
+  assert(!tk.isHeader("[foo.ts]"), "Tokenizer.isHeader: no hash");
+  assert(tk.isEnvelopeMarker("*** Begin Patch"), "Tokenizer.isEnvelopeMarker: begin");
+  assert(tk.isEnvelopeMarker("*** End Patch"), "Tokenizer.isEnvelopeMarker: end");
+  assert(tk.isEnvelopeMarker("*** Abort"), "Tokenizer.isEnvelopeMarker: abort");
+  assert(!tk.isEnvelopeMarker("SWAP 1.=1:"), "Tokenizer.isEnvelopeMarker: non-marker");
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\r\nSWAP 1.=1:\r\n+new");
+  assertEq(sections.length, 1, "parsePatch: CRLF input parses");
+  assertEq(sections[0]?.edits.length, 1, "parsePatch: CRLF one edit");
+  assertEq(sections[0]?.edits[0]?.kind, "swap", "parsePatch: CRLF swap kind");
+}
+
+{
+  const tk = new Tokenizer();
+  const tok = tk.tokenize("[foo.ts#1A2B]", 1) as Extract<Token, { kind: "header" }>;
+  assertEq(tok.path, "foo.ts", "tryParseHeader: valid path");
+  assertEq(tok.fileHash, "1A2B", "tryParseHeader: valid hash");
+
+  const tok2 = tk.tokenize("[foo.ts]", 1);
+  assertEq(tok2.kind, "raw", "tryParseHeader: no hash → raw");
+
+  const tok3 = tk.tokenize("[foo#bar#1234]", 1);
+  assertEq(tok3.kind, "raw", "tryParseHeader: path with # → raw");
+
+  const tok4 = tk.tokenize("[a#1234]", 1) as Extract<Token, { kind: "header" }>;
+  assertEq(tok4.path, "a", "tryParseHeader: short path");
+  assertEq(tok4.fileHash, "1234", "tryParseHeader: short path hash");
+}
+
+// ── Test 59: Executor ────────────────────────────────────────────────────────
+console.log("\n─ Executor ─");
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP 1.=3:\n+alpha\n+beta\n+gamma");
+  assertEq(sections.length, 1, "Executor: basic section count");
+  assertEq(sections[0]?.path, "foo.ts", "Executor: basic path");
+  assertEq(sections[0]?.hash, "1A2B", "Executor: basic hash");
+  assertEq(sections[0]?.edits.length, 1, "Executor: basic one edit");
+  const edit = sections[0]?.edits[0];
+  assertEq(edit?.kind, "swap", "Executor: basic swap kind");
+  if (edit?.kind === "swap") {
+    assertEq(edit.start, 1, "Executor: basic swap start");
+    assertEq(edit.end, 3, "Executor: basic swap end");
+    assertEq(edit.lines.length, 3, "Executor: basic swap lines");
+    assertEq(edit.lines[0], "alpha", "Executor: basic swap line 0");
+    assertEq(edit.lines[2], "gamma", "Executor: basic swap line 2");
+  }
+}
+
+{
+  const result = parsePatchStreaming("[foo.ts#1A2B]\nSWAP 1.=1:\n+new");
+  assertEq(result.sections.length, 1, "parsePatchStreaming: returns sections");
+  assertEq(result.sections[0]?.edits.length, 1, "parsePatchStreaming: one edit");
+  assert(Array.isArray(result.warnings), "parsePatchStreaming: returns warnings array");
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP 1.=1:\nalpha\nbeta");
+  assertEq(sections.length, 1, "Executor: bare body auto-piped");
+  const edit = sections[0]?.edits[0];
+  assertEq(edit?.kind, "swap", "Executor: bare body swap kind");
+  if (edit?.kind === "swap") {
+    assertEq(edit.lines.length, 2, "Executor: bare body 2 lines");
+    assertEq(edit.lines[0], "alpha", "Executor: bare body line 0");
+    assertEq(edit.lines[1], "beta", "Executor: bare body line 1");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.HEAD:\n+first\n\n+third");
+  assertEq(sections.length, 1, "Executor: deferred blanks interior kept");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "insert") {
+    assertEq(edit.lines.length, 3, "Executor: interior blank kept as empty line");
+    assertEq(edit.lines[0], "first", "Executor: interior blank line 0");
+    assertEq(edit.lines[1], "", "Executor: interior blank line 1 empty");
+    assertEq(edit.lines[2], "third", "Executor: interior blank line 2");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.HEAD:\n+first\n\n\n[bar.ts#3C4D]\nSWAP 1.=1:\n+x");
+  assertEq(sections.length, 2, "Executor: trailing blanks discarded");
+  const edit0 = sections[0]?.edits[0];
+  if (edit0?.kind === "insert") {
+    assertEq(edit0.lines.length, 1, "Executor: trailing blanks not in body");
+    assertEq(edit0.lines[0], "first", "Executor: trailing blanks only first kept");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\n# this is a comment\nSWAP 1.=1:\n+new");
+  assertEq(sections.length, 1, "Executor: skippable comment outside body");
+  assertEq(sections[0]?.edits.length, 1, "Executor: comment skipped, edit present");
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP 1.=3:\n1:alpha\n2:beta\n3:gamma");
+  assertEq(sections.length, 1, "Executor: uniform bare prefixes stripped");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "swap") {
+    assertEq(edit.lines[0], "alpha", "Executor: uniform strip line 0");
+    assertEq(edit.lines[1], "beta", "Executor: uniform strip line 1");
+    assertEq(edit.lines[2], "gamma", "Executor: uniform strip line 2");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP 1.=2:\n1:alpha\nbeta");
+  assertEq(sections.length, 1, "Executor: mixed bare prefixes not stripped");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "swap") {
+    assertEq(edit.lines[0], "1:alpha", "Executor: mixed prefix kept line 0");
+    assertEq(edit.lines[1], "beta", "Executor: mixed prefix line 1");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP 1.=2:\n1: \"one\"\n2: \"two\"");
+  assertEq(sections.length, 1, "Executor: YAML literal values not stripped");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "swap") {
+    assertEq(edit.lines[0], "1: \"one\"", "Executor: YAML kept line 0");
+    assertEq(edit.lines[1], "2: \"two\"", "Executor: YAML kept line 1");
+  }
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\nDEL 5\nDEL 5");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: overlapping deletes throw");
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\nDEL 5.=3:");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: DEL with colon throws");
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\n42");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: bare line number throws");
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\n1.=3:");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: bare range throws");
+}
+
+{
+  const sections = parsePatch("*** Begin Patch\n[foo.ts#1A2B]\nSWAP 1.=1:\n+new\n*** End Patch");
+  assertEq(sections.length, 1, "Executor: envelope markers handled");
+  assertEq(sections[0]?.edits.length, 1, "Executor: envelope one edit");
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP 1.=1:\n+new\n*** Abort\n[bar.ts#3C4D]\nSWAP 1.=1:\n+ignored");
+  assertEq(sections.length, 1, "Executor: abort stops processing");
+  assertEq(sections[0]?.path, "foo.ts", "Executor: abort keeps first section");
+}
+
+{
+  for (const sep of [".=", "-", "..", "…", "="]) {
+    const sections = parsePatch(`[foo.ts#1A2B]\nSWAP 1${sep}3:\n+new`);
+    const edit = sections[0]?.edits[0];
+    if (edit?.kind === "swap") {
+      assertEq(edit.start, 1, `Executor: range sep '${sep}' start`);
+      assertEq(edit.end, 3, `Executor: range sep '${sep}' end`);
+    }
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nDEL 5");
+  assertEq(sections.length, 1, "Executor: DEL single line");
+  const edit = sections[0]?.edits[0];
+  assertEq(edit?.kind, "delete", "Executor: DEL single kind");
+  if (edit?.kind === "delete") {
+    assertEq(edit.start, 5, "Executor: DEL single start");
+    assertEq(edit.end, 5, "Executor: DEL single end");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nDEL 3.=7");
+  assertEq(sections.length, 1, "Executor: DEL range");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "delete") {
+    assertEq(edit.start, 3, "Executor: DEL range start");
+    assertEq(edit.end, 7, "Executor: DEL range end");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.PRE 5:\n+before");
+  const edit = sections[0]?.edits[0];
+  assertEq(edit?.kind, "insert", "Executor: INS.PRE kind");
+  if (edit?.kind === "insert") {
+    assertEq(edit.position, "before", "Executor: INS.PRE position");
+    assertEq(edit.anchor, 5, "Executor: INS.PRE anchor");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.POST 5:\n+after");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "insert") {
+    assertEq(edit.position, "after", "Executor: INS.POST position");
+    assertEq(edit.anchor, 5, "Executor: INS.POST anchor");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.HEAD:\n+head");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "insert") {
+    assertEq(edit.position, "head", "Executor: INS.HEAD position");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.TAIL:\n+tail");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "insert") {
+    assertEq(edit.position, "tail", "Executor: INS.TAIL position");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP.BLK 5:\n+block content");
+  const edit = sections[0]?.edits[0];
+  assertEq(edit?.kind, "block", "Executor: SWAP.BLK kind");
+  if (edit?.kind === "block") {
+    assertEq(edit.blockOp, "swap", "Executor: SWAP.BLK blockOp");
+    assertEq(edit.anchor, 5, "Executor: SWAP.BLK anchor");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nDEL.BLK 5");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "block") {
+    assertEq(edit.blockOp, "delete", "Executor: DEL.BLK blockOp");
+    assertEq(edit.anchor, 5, "Executor: DEL.BLK anchor");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.BLK.POST 5:\n+after block");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "block") {
+    assertEq(edit.blockOp, "insert_after", "Executor: INS.BLK.POST blockOp");
+    assertEq(edit.anchor, 5, "Executor: INS.BLK.POST anchor");
+  }
+}
+
+{
+  const sections = parsePatch("[a.ts#1111]\nSWAP 1.=1:\n+first\n[b.ts#2222]\nSWAP 1.=1:\n+second");
+  assertEq(sections.length, 2, "Executor: multi-section");
+  assertEq(sections[0]?.path, "a.ts", "Executor: multi-section path 0");
+  assertEq(sections[1]?.path, "b.ts", "Executor: multi-section path 1");
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nSWAP 1.=1:\n++x\n+++y");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "swap") {
+    assertEq(edit.lines[0], "+x", "Executor: literal + prefix line 0");
+    assertEq(edit.lines[1], "++y", "Executor: literal + prefix line 1");
+  }
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\nINS.POST 1:\n+\n+nextblank");
+  const edit = sections[0]?.edits[0];
+  if (edit?.kind === "insert") {
+    assertEq(edit.lines[0], "", "Executor: bare + produces empty string");
+    assertEq(edit.lines[1], "nextblank", "Executor: bare + next line");
+  }
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\nSWAP 1.=1:\n+new\n-old");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: minus row in body throws");
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\nSWAP.BLK 5:");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: empty SWAP.BLK throws");
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\n*** Update File: bar.ts\nSWAP 1.=1:\n+new");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: apply_patch sentinel in body throws");
+}
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\nSWAP 1.=1:\n+new\n@@ -1,3 +1,3 @@");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "Executor: @@ hunk header in body throws");
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\n# trailing comment");
+  assertEq(sections.length, 1, "Executor: trailing comment after section doesn't throw");
+}
+
+{
+  const sections = parsePatch("[foo.ts#1A2B]\n# comment\n[bar.ts#3C4D]\nSWAP 1.=1:\n+x");
+  assertEq(sections.length, 2, "Executor: comment between sections doesn't throw");
+  assertEq(sections[1]?.path, "bar.ts", "Executor: comment between sections second path");
+}
+
+{
+  const sections = parsePatch("[***Update File:foo.ts#1A2B]\nSWAP 1.=1:\n+new");
+  assertEq(sections[0]?.path, "foo.ts", "Executor: recovery header strips noise via tokenizer");
+  assertEq(sections[0]?.hash, "1A2B", "Executor: recovery header hash via tokenizer");
 }
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
