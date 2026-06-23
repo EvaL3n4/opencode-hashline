@@ -18,7 +18,7 @@ import {
   unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
   trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
-  buildNumberedDiff, buildCompactDiffPreview,
+  buildNumberedDiff, buildCompactDiffPreview, buildSnapshotTable,
   EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
   blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
@@ -1684,6 +1684,62 @@ await (async () => {
   try { rmSync(pyPathTrailing); } catch {}
   try { rmSync(tsPathTrailing); } catch {}
 })();
+
+// ── Test 56: Compaction survival ─────────────────────────────────────────────
+console.log("\n─ Compaction survival ─");
+
+{
+  const store = new SnapshotStore();
+  store.record("/worktree/src/a.ts", "alpha\nbeta\ngamma\n", [1, 2, 3], "session-a");
+  store.record("/worktree/src/b.ts", "delta\nepsilon\n", [1], "session-b");
+
+  const aEntries = store.entriesForSession("session-a");
+  assertEq(aEntries.length, 1, "entriesForSession: session-a → 1 entry");
+  if (aEntries[0]) {
+    assertEq(aEntries[0].path, "/worktree/src/a.ts", "entriesForSession: session-a path");
+    assertEq(aEntries[0].lineCount, 4, "entriesForSession: session-a lineCount (3 content + trailing empty)");
+  }
+
+  const bEntries = store.entriesForSession("session-b");
+  assertEq(bEntries.length, 1, "entriesForSession: session-b → 1 entry");
+  if (bEntries[0]) {
+    assertEq(bEntries[0].path, "/worktree/src/b.ts", "entriesForSession: session-b path");
+  }
+
+  const allEntries = store.entriesForSession();
+  assertEq(allEntries.length, 2, "entriesForSession: no filter → all entries");
+
+  const taggedTable = buildSnapshotTable(aEntries, "/worktree");
+  assert(taggedTable.includes("[src/a.ts#"), `buildSnapshotTable: contains [src/a.ts#... prefix (got: ${taggedTable})`);
+  assert(taggedTable.includes(" seen:1-3"), `buildSnapshotTable: contains seen:1-3 (got: ${taggedTable})`);
+  assert(!taggedTable.includes("/worktree/"), "buildSnapshotTable: paths relative to worktree");
+
+  const untaggedTable = buildSnapshotTable(allEntries);
+  assert(untaggedTable.includes("/worktree/src/a.ts"), "buildSnapshotTable: no worktree → absolute paths");
+
+  const emptyTable = buildSnapshotTable([]);
+  assertEq(emptyTable, "", "buildSnapshotTable: empty entries → empty string");
+
+  const noSeenEntry: { path: string; hash: string; seenLines?: Set<number>; lineCount: number } = {
+    path: "/worktree/src/c.ts",
+    hash: "DEAD",
+    lineCount: 2,
+  };
+  const noSeenTable = buildSnapshotTable([noSeenEntry], "/worktree");
+  assert(!noSeenTable.includes(" seen:"), "buildSnapshotTable: no seenLines → no ' seen:' suffix");
+
+  const compat = new SnapshotStore();
+  compat.record("/worktree/src/legacy.ts", "line1\nline2\n");
+  const legacyEntries = compat.entriesForSession("any-session");
+  assertEq(legacyEntries.length, 1, "entriesForSession: backward compat — undefined sessionID still matches");
+
+  const contextStr =
+    "Active file snapshots — these [path#tag] anchors remain valid after compaction. " +
+    "The model uses them in edit operations. Preserve the tags and file paths in your summary.\n\n" +
+    buildSnapshotTable(aEntries, "/worktree");
+  assert(contextStr.startsWith("Active file snapshots —"), "compaction context: starts with preamble");
+  assert(contextStr.includes("[src/a.ts#"), "compaction context: contains table");
+}
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 

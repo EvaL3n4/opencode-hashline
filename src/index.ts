@@ -14,6 +14,7 @@ interface Snapshot {
   hash: string;
   recordedAt: number;
   seenLines?: Set<number>;
+  sessionID?: string;
 }
 
 type EditOp =
@@ -118,10 +119,10 @@ class SnapshotStore {
   private store = new Map<string, Snapshot[]>();
   private totalBytes = 0;
 
-  record(path: string, text: string, seenLines?: Iterable<number>): string {
+  record(path: string, text: string, seenLines?: Iterable<number>, sessionID?: string): string {
     const normalized = normalizeForStorage(text);
     const hash = computeFileHash(normalized);
-    const snapshot: Snapshot = { path, text: normalized, hash, recordedAt: Date.now() };
+    const snapshot: Snapshot = { path, text: normalized, hash, recordedAt: Date.now(), sessionID };
     mergeSeenLines(snapshot, seenLines);
 
     let versions = this.store.get(path);
@@ -133,6 +134,7 @@ class SnapshotStore {
     const existing = versions.find((s) => s.hash === hash);
     if (existing) {
       existing.recordedAt = Date.now();
+      if (existing.sessionID === undefined) existing.sessionID = sessionID;
       mergeSeenLines(existing, seenLines);
       return hash;
     }
@@ -166,6 +168,23 @@ class SnapshotStore {
     const versions = this.store.get(path);
     if (!versions || versions.length === 0) return null;
     return versions[versions.length - 1]!;
+  }
+
+  entriesForSession(sessionID?: string): Array<{ path: string; hash: string; seenLines?: Set<number>; lineCount: number; recordedAt: number }> {
+    const result: Array<{ path: string; hash: string; seenLines?: Set<number>; lineCount: number; recordedAt: number }> = [];
+    for (const [, versions] of this.store) {
+      const head = versions[versions.length - 1];
+      if (!head) continue;
+      if (sessionID !== undefined && head.sessionID !== undefined && head.sessionID !== sessionID) continue;
+      result.push({
+        path: head.path,
+        hash: head.hash,
+        seenLines: head.seenLines,
+        lineCount: head.text.split("\n").length,
+        recordedAt: head.recordedAt,
+      });
+    }
+    return result;
   }
 
   invalidate(path: string): void {
@@ -1525,6 +1544,21 @@ function formatLineRanges(lines: readonly number[]): string {
   return parts.join(", ");
 }
 
+function buildSnapshotTable(
+  entries: Array<{ path: string; hash: string; seenLines?: Set<number>; lineCount: number }>,
+  worktree?: string,
+): string {
+  if (entries.length === 0) return "";
+  const lines = entries.map((e) => {
+    const rel = worktree ? path.relative(worktree, e.path) : e.path;
+    const seen = e.seenLines && e.seenLines.size > 0
+      ? ` seen:${formatLineRanges([...e.seenLines])}`
+      : "";
+    return `[${rel}#${e.hash}]${seen}`;
+  });
+  return lines.join("\n");
+}
+
 function unseenLinesMessage(sectionPath: string, unseenLines: readonly number[], tag: string): string {
   const ranges = formatLineRanges(unseenLines);
   return (
@@ -1972,7 +2006,7 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
         pendingCalls.delete(input.callID);
         const canonical = canonicalPath(callInfo.filePath);
         const rawContent = callInfo.rawContent ?? "";
-        const hash = snapshotStore.record(canonical, rawContent);
+        const hash = snapshotStore.record(canonical, rawContent, undefined, input.sessionID);
         const seenLines = parseSeenLinesFromHashlineBody(output.output ?? "");
         if (seenLines.length > 0) {
           snapshotStore.recordSeenLines(canonical, hash, seenLines);
@@ -1984,7 +2018,7 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
         pendingCalls.delete(input.callID);
         const canonical = canonicalPath(callInfo.filePath);
         const content = callInfo.writeContent ?? "";
-        const hash = snapshotStore.record(canonical, content);
+        const hash = snapshotStore.record(canonical, content, undefined, input.sessionID);
         if (output.output) {
           output.output = `[${callInfo.filePath}#${hash}]\n${output.output}`;
         } else {
@@ -1996,11 +2030,31 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
     "experimental.chat.system.transform": async (input, output) => {
       if (isInternalAgent(output.system)) return;
 
-      if (output.system.length > 0) {
-        output.system[output.system.length - 1] += "\n\n" + HASHLINE_PROMPT;
-      } else {
-        output.system.push(HASHLINE_PROMPT);
+      let prompt = HASHLINE_PROMPT;
+      const entries = snapshotStore.entriesForSession(input.sessionID);
+      if (entries.length > 0) {
+        const table = buildSnapshotTable(entries, worktree);
+        if (table) {
+          prompt += "\n\n<hashline-snapshots>\nActive file tags — use these in edit operations. Re-read the file if a tag doesn't match.\n" + table + "\n</hashline-snapshots>";
+        }
       }
+
+      if (output.system.length > 0) {
+        output.system[output.system.length - 1] += "\n\n" + prompt;
+      } else {
+        output.system.push(prompt);
+      }
+    },
+
+    "experimental.session.compacting": async (input, output) => {
+      const entries = snapshotStore.entriesForSession(input.sessionID);
+      if (entries.length === 0) return;
+      const table = buildSnapshotTable(entries, worktree);
+      if (!table) return;
+      output.context.push(
+        "Active file snapshots — these [path#tag] anchors remain valid after compaction. " +
+        "The model uses them in edit operations. Preserve the tags and file paths in your summary.\n\n" + table,
+      );
     },
 
     tool: {
@@ -2042,7 +2096,7 @@ export {
   unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
   trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
-  buildNumberedDiff, buildCompactDiffPreview,
+  buildNumberedDiff, buildCompactDiffPreview, buildSnapshotTable,
   EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
   blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
