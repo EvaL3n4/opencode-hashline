@@ -1661,8 +1661,9 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
 export {
   type Snapshot, type EditOp, type PatchSection, type LineEnding,
   type DelimiterBalance, type BoundaryEcho, type RecoveryResult, type MismatchDetails,
+  type CompactDiffPreview,
   detectLineEnding, normalizeToLF, restoreLineEndings, stripBom, normalizeForStorage,
-  normalizeFileText, computeFileHash, SnapshotStore, canonicalPath,
+  normalizeFileText, computeFileHash, SnapshotStore, snapshotStore, canonicalPath,
   parsePatch, applyEdits, getAnchorLine, applySingleEdit, lineDiff,
   isStructuralCloserLine, computeDelimiterBalance, balanceDelta, balanceNegate,
   balanceEqual, balanceIsZero, hasNonWhitespace, leadingIndent, isIndentDeeper,
@@ -1678,6 +1679,10 @@ export {
   HEADTAIL_DRIFT_WARNING, RECOVERY_EXTERNAL_WARNING,
   RECOVERY_SESSION_CHAIN_WARNING, RECOVERY_SESSION_REPLAY_WARNING,
   MISMATCH_CONTEXT,
+  unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
+  detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
+  trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
+  buildNumberedDiff, buildCompactDiffPreview,
 };
 export default HashlinePlugin;
 export { HashlinePlugin };

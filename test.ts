@@ -1,17 +1,24 @@
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import {
-  type EditOp,
+  type EditOp, type CompactDiffPreview,
   detectLineEnding, normalizeToLF, restoreLineEndings, stripBom, normalizeForStorage,
-  normalizeFileText, computeFileHash, SnapshotStore,
+  normalizeFileText, computeFileHash, SnapshotStore, snapshotStore, canonicalPath,
   parsePatch, applyEdits, lineDiff,
   isStructuralCloserLine, computeDelimiterBalance, balanceDelta, balanceNegate,
   balanceEqual, balanceIsZero, hasNonWhitespace, leadingIndent, isIndentDeeper,
   repairEdits,
   hasAnchorScopedEdit, collectAnchorLines, verifyAnchorContent, findFirstChangedLine,
   applyEditsToSnapshot, replaySessionChainOnCurrent, tryRecover,
-  formatAnchoredContext, formatMismatchError,
+  formatAnchoredContext, formatMismatchError, MismatchError,
+  parseSeenLinesFromHashlineBody, formatLineRanges, unseenLinesMessage, assertSeenLines,
+  hashPatchInput, recordNoopEdit, resetNoopEdit,
+  noChangeDiagnostic, noChangeLoopDiagnostic, NOOP_HARD_LIMIT,
   RECOVERY_EXTERNAL_WARNING, RECOVERY_SESSION_REPLAY_WARNING,
+  unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
+  detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
+  trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
+  buildNumberedDiff, buildCompactDiffPreview,
 } from "./src/index.ts";
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
@@ -874,6 +881,478 @@ console.log("\n─ SnapshotStore: version limit ─");
   assert(store.byHash(filePath, hashes[2]!) !== null, "version 2 retained");
   assert(store.byHash(filePath, hashes[5]!) !== null, "version 5 retained");
   assertEq(store.head(filePath)?.hash, hashes[5], "head is latest version");
+}
+
+// ── Test 44: Write tool utilities ────────────────────────────────────────────
+console.log("\n─ Write tool utilities ─");
+
+assertEq(unwrapHashlineHeaderPath("[src/foo.ts#1A2B]"), "src/foo.ts", "unwrapHashlineHeaderPath: [src/foo.ts#1A2B] → src/foo.ts");
+assertEq(unwrapHashlineHeaderPath("[foo.ts#ABCD]"), "foo.ts", "unwrapHashlineHeaderPath: [foo.ts#ABCD] → foo.ts");
+assertEq(unwrapHashlineHeaderPath("src/foo.ts"), "src/foo.ts", "unwrapHashlineHeaderPath: no brackets → as-is");
+assertEq(unwrapHashlineHeaderPath("[]"), "[]", "unwrapHashlineHeaderPath: too short → as-is");
+assertEq(unwrapHashlineHeaderPath("[a]"), "a", "unwrapHashlineHeaderPath: no tag → path extracted");
+assertEq(unwrapHashlineHeaderPath("[a#1#A1B2]"), "[a#1#A1B2]", "unwrapHashlineHeaderPath: embedded # in path → rejected");
+assertEq(unwrapHashlineHeaderPath("[foo.ts#ZZZZ]"), "[foo.ts#ZZZZ]", "unwrapHashlineHeaderPath: non-hex tag → rejected");
+assertEq(unwrapHashlineHeaderPath("[foo.ts#1A2B]  "), "foo.ts", "unwrapHashlineHeaderPath: trimEnd handles trailing whitespace");
+
+assertEq(stripLeadingHashlinePrefix("1:hello"), "hello", "stripLeadingHashlinePrefix: 1:hello → hello");
+assertEq(stripLeadingHashlinePrefix("42:world"), "world", "stripLeadingHashlinePrefix: 42:world → world");
+assertEq(stripLeadingHashlinePrefix("hello"), "hello", "stripLeadingHashlinePrefix: no prefix → as-is");
+assertEq(stripLeadingHashlinePrefix(" 3:indented"), "indented", "stripLeadingHashlinePrefix: leading space ok");
+
+{
+  const lines1 = ["1:foo", "2:bar"];
+  const out1 = stripHashlinePrefixes(lines1);
+  assertEq(JSON.stringify(out1), JSON.stringify(["foo", "bar"]), "stripHashlinePrefixes: all prefixed → stripped");
+
+  const lines2 = ["1:foo", "bar"];
+  const out2 = stripHashlinePrefixes(lines2);
+  assertEq(out2, lines2, "stripHashlinePrefixes: mixed → returned by reference");
+  assertEq(JSON.stringify(out2), JSON.stringify(["1:foo", "bar"]), "stripHashlinePrefixes: mixed → content unchanged");
+
+  const lines3 = ["[foo.ts#1A2B]", "1:foo", "2:bar"];
+  const out3 = stripHashlinePrefixes(lines3);
+  assertEq(JSON.stringify(out3), JSON.stringify(["foo", "bar"]), "stripHashlinePrefixes: header stripped + prefixes stripped");
+
+  const lines4 = ["", "1:foo", ""];
+  const out4 = stripHashlinePrefixes(lines4);
+  assertEq(JSON.stringify(out4), JSON.stringify(["", "foo", ""]), "stripHashlinePrefixes: empty lines preserved, prefixes stripped");
+
+  const lines5 = ["1:foo", "bar"];
+  const out5 = stripHashlinePrefixes(lines5);
+  assert(out5 === lines5, "stripHashlinePrefixes: returns reference-equal to input on mismatch");
+
+  const lines6 = ["[Showing lines 1-10 of 20. Use :L1]", "1:foo"];
+  const out6 = stripHashlinePrefixes(lines6);
+  assertEq(JSON.stringify(out6), JSON.stringify(["foo"]), "stripHashlinePrefixes: truncation notice stripped");
+}
+
+assertEq(stripWriteContent("1:hello\n2:world\n"), "hello\nworld\n", "stripWriteContent: prefixes stripped");
+assertEq(stripWriteContent("[foo.ts#1A2B]\n1:hello\n2:world"), "hello\nworld", "stripWriteContent: header + prefixes stripped");
+assertEq(stripWriteContent("hello\nworld"), "hello\nworld", "stripWriteContent: no prefixes/no header → as-is");
+assertEq(stripWriteContent("[foo.ts#1A2B]\nhello\nworld"), "[foo.ts#1A2B]\nhello\nworld", "stripWriteContent: header but body not prefixed → as-is");
+
+// ── Test 45: Parser contamination detection ──────────────────────────────────
+console.log("\n─ Parser contamination detection ─");
+
+assert(detectContamination("*** Update File:foo.ts") !== null, "detectContamination: Update File sentinel");
+assert(detectContamination("*** Add File:bar.ts") !== null, "detectContamination: Add File sentinel");
+assert(detectContamination("*** Delete File:baz.ts") !== null, "detectContamination: Delete File sentinel");
+assert(detectContamination("*** Move to:qux.ts") !== null, "detectContamination: Move to sentinel");
+assert(detectContamination("@@ -1,3 +1,3 @@") !== null, "detectContamination: unified-diff hunk header");
+assert(detectContamination("@@ -1 +1 @@") !== null, "detectContamination: simple @@ hunk header");
+assert(detectContamination("@@@") !== null, "detectContamination: starts with @@ fallback");
+assertEq(detectContamination(""), null, "detectContamination: empty → null");
+assertEq(detectContamination("   "), null, "detectContamination: whitespace only → null");
+assertEq(detectContamination("SWAP 1.=3:"), null, "detectContamination: valid hashline op → null");
+assertEq(detectContamination("[foo.ts#1A2B]"), null, "detectContamination: valid header → null");
+
+{
+  let threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\n*** Update File:foo.ts\nSWAP 1.=1:\n+new");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "parsePatch: contamination detected (Update File inside section) → throws");
+
+  const abortSections = parsePatch("[foo.ts#1A2B]\n*** Abort");
+  assertEq(abortSections.length, 1, "parsePatch: *** Abort breaks the loop, current section pushed");
+  assertEq(abortSections[0]?.path, "foo.ts", "parsePatch: *** Abort path preserved");
+  assertEq(abortSections[0]?.hash, "1A2B", "parsePatch: *** Abort hash preserved");
+  assertEq(abortSections[0]?.edits.length, 0, "parsePatch: *** Abort edits empty");
+
+  threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\nSWAP 1.=1:\n-new");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "parsePatch: `-` body row → throws");
+
+  threw = false;
+  try {
+    parsePatch("[foo.ts#1A2B]\nSWAP 1.=1:");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "parsePatch: empty SWAP body → throws");
+}
+
+// ── Test 46: Line bounds validation ──────────────────────────────────────────
+console.log("\n─ Line bounds validation ─");
+
+{
+  const fileLines = ["a", "b", "c"];
+
+  assertEq(validateLineBounds([{ kind: "swap", start: 1, end: 3, lines: ["x", "y", "z"] }], fileLines), null, "validateLineBounds: valid 1-3 swap");
+  assert(validateLineBounds([{ kind: "swap", start: 1, end: 4, lines: ["x"] }], fileLines) !== null, "validateLineBounds: end > lineCount");
+  assert(validateLineBounds([{ kind: "swap", start: 0, end: 1, lines: ["x"] }], fileLines) !== null, "validateLineBounds: start < 1");
+  assertEq(validateLineBounds([{ kind: "delete", start: 2, end: 2 }], fileLines), null, "validateLineBounds: valid delete 2-2");
+  assert(validateLineBounds([{ kind: "delete", start: 5, end: 5 }], fileLines) !== null, "validateLineBounds: delete out of bounds");
+  assertEq(validateLineBounds([{ kind: "insert", position: "before", anchor: 2, lines: ["x"] }], fileLines), null, "validateLineBounds: valid INS.PRE 2");
+  assertEq(validateLineBounds([{ kind: "insert", position: "after", anchor: 3, lines: ["x"] }], fileLines), null, "validateLineBounds: valid INS.POST 3");
+  assert(validateLineBounds([{ kind: "insert", position: "after", anchor: 4, lines: ["x"] }], fileLines) !== null, "validateLineBounds: INS.POST out of bounds");
+  assertEq(validateLineBounds([{ kind: "insert", position: "head", anchor: 0, lines: ["x"] }], fileLines), null, "validateLineBounds: INS.HEAD skipped");
+  assertEq(validateLineBounds([{ kind: "insert", position: "tail", anchor: 0, lines: ["x"] }], fileLines), null, "validateLineBounds: INS.TAIL skipped");
+}
+
+// ── Test 47: Header recovery ─────────────────────────────────────────────────
+console.log("\n─ Header recovery ─");
+
+assertEq(stripApplyPatchPathNoise("***Update File:foo.ts"), "foo.ts", "stripApplyPatchPathNoise: ***Update File:");
+assertEq(stripApplyPatchPathNoise("Update File:foo.ts"), "foo.ts", "stripApplyPatchPathNoise: Update File:");
+assertEq(stripApplyPatchPathNoise("***foo.ts"), "foo.ts", "stripApplyPatchPathNoise: ***foo.ts");
+assertEq(stripApplyPatchPathNoise("foo.ts"), "foo.ts", "stripApplyPatchPathNoise: clean path unchanged");
+
+assertEq(JSON.stringify(tryParseRecoveryHeader("[***Update File:foo.ts#CB5A]")), JSON.stringify({ path: "foo.ts", hash: "CB5A" }), "tryParseRecoveryHeader: noise stripped + hash uppercase");
+assertEq(JSON.stringify(tryParseRecoveryHeader("[foo.ts#1A2B]")), JSON.stringify({ path: "foo.ts", hash: "1A2B" }), "tryParseRecoveryHeader: normal case works");
+assertEq(tryParseRecoveryHeader("[foo#bar#1234]"), null, "tryParseRecoveryHeader: embedded # in body → null");
+assertEq(tryParseRecoveryHeader("[]"), null, "tryParseRecoveryHeader: empty body → null");
+assertEq(tryParseRecoveryHeader("[foo.ts]"), null, "tryParseRecoveryHeader: no tag → null");
+assertEq(tryParseRecoveryHeader("not a header"), null, "tryParseRecoveryHeader: not a bracket line → null");
+
+{
+  const r1 = tryParseRecoveryHeader("[***Update File:foo.ts#CB5A]");
+  assertEq(r1?.hash, "CB5A", "tryParseRecoveryHeader: hash is uppercase");
+}
+
+{
+  const recoverySections = parsePatch("[***Update File:foo.ts#1A2B]\nSWAP 1.=1:\n+new");
+  assertEq(recoverySections.length, 1, "parsePatch: recovery header parses one section");
+  assertEq(recoverySections[0]?.path, "foo.ts", "parsePatch: recovery header path noise stripped");
+  assertEq(recoverySections[0]?.hash, "1A2B", "parsePatch: recovery header hash preserved");
+}
+
+// ── Test 48: MismatchError class ─────────────────────────────────────────────
+console.log("\n─ MismatchError class ─");
+
+{
+  const err = new MismatchError({
+    path: "foo.ts",
+    expectedHash: "1A2B",
+    actualHash: "3C4D",
+    fileLines: ["a", "b"],
+    anchorLines: [1],
+    hashRecognized: true,
+  });
+  assert(err instanceof Error, "MismatchError: instanceof Error");
+  assert(err instanceof MismatchError, "MismatchError: instanceof MismatchError");
+  assertEq(err.name, "MismatchError", "MismatchError: .name set");
+  assertEq(err.path, "foo.ts", "MismatchError: .path set");
+  assertEq(err.expectedHash, "1A2B", "MismatchError: .expectedHash set");
+  assertEq(err.actualHash, "3C4D", "MismatchError: .actualHash set");
+  assertEq(err.hashRecognized, true, "MismatchError: .hashRecognized set");
+  assert(err.message.includes("file changed between read and edit"), "MismatchError (recognized): message mentions file change");
+  assertEq(err.displayMessage, err.message, "MismatchError: .displayMessage === .message");
+}
+
+{
+  const errUnrecognized = new MismatchError({
+    path: "foo.ts",
+    expectedHash: "0000",
+    actualHash: "3C4D",
+    fileLines: [],
+    anchorLines: [],
+    hashRecognized: false,
+  });
+  assert(errUnrecognized.message.includes("not from this session"), "MismatchError (unrecognized): mentions not from session");
+}
+
+{
+  const header1 = MismatchError.rejectionHeader({
+    path: "foo.ts",
+    expectedHash: "1A2B",
+    actualHash: "3C4D",
+    fileLines: [],
+    anchorLines: [],
+    hashRecognized: true,
+  });
+  assert(Array.isArray(header1), "rejectionHeader: returns array");
+  assertEq(header1.length, 2, "rejectionHeader: 2 strings");
+  assert(header1[0]!.includes("file changed between read and edit"), "rejectionHeader (recognized): line 0 mentions file change");
+
+  const header2 = MismatchError.rejectionHeader({
+    path: "foo.ts",
+    expectedHash: "0000",
+    actualHash: "3C4D",
+    fileLines: [],
+    anchorLines: [],
+    hashRecognized: false,
+  });
+  assert(header2[0]!.includes("not from this session"), "rejectionHeader (unrecognized): line 0 mentions not from session");
+}
+
+{
+  const details = {
+    path: "foo.ts",
+    expectedHash: "1A2B",
+    actualHash: "3C4D",
+    fileLines: ["a", "b"],
+    anchorLines: [1] as readonly number[],
+    hashRecognized: true,
+  };
+  const fromFormat = formatMismatchError(details);
+  const fromClass = new MismatchError(details).displayMessage;
+  assertEq(fromFormat, fromClass, "formatMismatchError produces same output as MismatchError.displayMessage");
+}
+
+// ── Test 49: canonicalPath for non-existing files ────────────────────────────
+console.log("\n─ canonicalPath for non-existing files ─");
+
+{
+  const existingFile = join(tmpDir, "exists.txt");
+  writeFileSync(existingFile, "hello\n");
+  const realExisting = canonicalPath(existingFile);
+  assert(realExisting.includes(tmpDir), "canonicalPath: existing file → realpath contains tmpDir");
+  assert(realExisting.endsWith("exists.txt"), "canonicalPath: existing file → realpath ends with basename");
+
+  const nonExistingInDir = join(tmpDir, "nonexistent.txt");
+  const realNonExisting = canonicalPath(nonExistingInDir);
+  assert(realNonExisting.includes(tmpDir), "canonicalPath: non-existing in existing dir → realpath contains tmpDir");
+  assert(realNonExisting.endsWith("nonexistent.txt"), "canonicalPath: non-existing → realpath ends with basename");
+
+  const nonExistingInMissingDir = join(tmpDir, "nonexistent-dir", "file.txt");
+  const realMissing = canonicalPath(nonExistingInMissingDir);
+  assertEq(realMissing, nonExistingInMissingDir, "canonicalPath: non-existing in non-existing dir → input as-is");
+}
+
+// ── Test 50: Trailing phantom line ───────────────────────────────────────────
+console.log("\n─ Trailing phantom line ─");
+
+assertEq(trailingPhantomLine(["a", "b", "c"]), 0, "trailingPhantomLine: no phantom");
+assertEq(trailingPhantomLine(["a", "b", ""]), 3, "trailingPhantomLine: phantom at line 3");
+assertEq(trailingPhantomLine(["a", "b", "c", ""]), 4, "trailingPhantomLine: phantom at line 4");
+assertEq(trailingPhantomLine([""]), 0, "trailingPhantomLine: length 1 → 0");
+assertEq(trailingPhantomLine([]), 0, "trailingPhantomLine: length 0 → 0");
+assertEq(trailingPhantomLine(["", ""]), 2, "trailingPhantomLine: phantom at line 2");
+
+{
+  const fileLines = ["a", "b", ""];
+
+  const r1 = dropTrailingPhantomDeletes([{ kind: "delete", start: 3, end: 3 }], fileLines);
+  assertEq(r1.length, 0, "dropTrailingPhantomDeletes: single phantom delete dropped");
+
+  const r2 = dropTrailingPhantomDeletes([{ kind: "delete", start: 2, end: 3 }], fileLines);
+  assertEq(r2.length, 1, "dropTrailingPhantomDeletes: range clamped to 1 edit");
+  if (r2[0]?.kind === "delete") {
+    assertEq(r2[0].start, 2, "dropTrailingPhantomDeletes: clamped start");
+    assertEq(r2[0].end, 2, "dropTrailingPhantomDeletes: clamped end to phantom-1");
+  }
+
+  const r3 = dropTrailingPhantomDeletes([{ kind: "delete", start: 1, end: 1 }], fileLines);
+  assertEq(r3.length, 1, "dropTrailingPhantomDeletes: unaffected delete preserved");
+  if (r3[0]?.kind === "delete") {
+    assertEq(r3[0].start, 1, "dropTrailingPhantomDeletes: unaffected delete start preserved");
+  }
+
+  const r4 = dropTrailingPhantomDeletes([{ kind: "swap", start: 1, end: 1, lines: ["x"] }], fileLines);
+  assertEq(r4.length, 1, "dropTrailingPhantomDeletes: swap unaffected");
+
+  const r5 = dropTrailingPhantomDeletes([{ kind: "delete", start: 3, end: 3 }], ["a", "b", "c"]);
+  assertEq(r5.length, 1, "dropTrailingPhantomDeletes: no phantom → copied");
+  if (r5[0]?.kind === "delete") {
+    assertEq(r5[0].start, 3, "dropTrailingPhantomDeletes: no phantom → delete preserved");
+  }
+}
+
+// ── Test 51: Multi-section duplicate path detection ──────────────────────────
+console.log("\n─ Multi-section duplicate paths ─");
+
+{
+  const ok = assertUniqueCanonicalPaths([
+    { path: "foo.ts", hash: "1A2B", edits: [] },
+    { path: "bar.ts", hash: "3C4D", edits: [] },
+  ]);
+  assertEq(ok, null, "assertUniqueCanonicalPaths: different paths → null");
+
+  const dup = assertUniqueCanonicalPaths([
+    { path: "foo.ts", hash: "1A2B", edits: [] },
+    { path: "foo.ts", hash: "3C4D", edits: [] },
+  ]);
+  assert(dup !== null, "assertUniqueCanonicalPaths: same path → error");
+  if (dup) {
+    assert(dup.includes("Multiple sections resolve to the same file"), "assertUniqueCanonicalPaths: error mentions duplicates");
+    assert(dup.includes("foo.ts"), "assertUniqueCanonicalPaths: error mentions path");
+  }
+
+  const single = assertUniqueCanonicalPaths([
+    { path: "foo.ts", hash: "1A2B", edits: [] },
+  ]);
+  assertEq(single, null, "assertUniqueCanonicalPaths: single section → null");
+}
+
+// ── Test 52: Compact diff preview ────────────────────────────────────────────
+console.log("\n─ Compact diff preview ─");
+
+{
+  const d1 = buildNumberedDiff("a\nb\nc", "a\nx\nc");
+  assert(d1.includes(" 1|a"), "buildNumberedDiff: context line 1");
+  assert(d1.includes("-2|b"), "buildNumberedDiff: removal at line 2");
+  assert(d1.includes("+2|x"), "buildNumberedDiff: addition at line 2");
+  assert(d1.includes(" 3|c"), "buildNumberedDiff: context line 3");
+
+  const d2 = buildNumberedDiff("hello", "hello");
+  assertEq(d2, "", "buildNumberedDiff: identical → empty");
+
+  const d3 = buildNumberedDiff("a\nb", "a\nb\nc");
+  assert(d3.includes("+3|c"), "buildNumberedDiff: appended line at 3");
+}
+
+{
+  const p1: CompactDiffPreview = buildCompactDiffPreview("");
+  assertEq(p1.preview, "", "buildCompactDiffPreview: empty diff → empty preview");
+  assertEq(p1.addedLines, 0, "buildCompactDiffPreview: empty diff → 0 added");
+  assertEq(p1.removedLines, 0, "buildCompactDiffPreview: empty diff → 0 removed");
+
+  const p2: CompactDiffPreview = buildCompactDiffPreview("+1|new\n+2|line");
+  assertEq(p2.preview, "1:new\n2:line", "buildCompactDiffPreview: all-added (no elision)");
+  assertEq(p2.addedLines, 2, "buildCompactDiffPreview: all-added → 2 added");
+  assertEq(p2.removedLines, 0, "buildCompactDiffPreview: all-added → 0 removed");
+
+  const p3: CompactDiffPreview = buildCompactDiffPreview("-1|old\n-2|gone");
+  assertEq(p3.preview, "", "buildCompactDiffPreview: all-removed → empty preview");
+  assertEq(p3.addedLines, 0, "buildCompactDiffPreview: all-removed → 0 added");
+  assertEq(p3.removedLines, 2, "buildCompactDiffPreview: all-removed → 2 removed");
+
+  const p4: CompactDiffPreview = buildCompactDiffPreview(" 1|ctx\n-2|old\n+2|new\n 3|ctx");
+  assert(p4.preview.includes("1:ctx"), "buildCompactDiffPreview: mixed contains ctx line 1");
+  assert(p4.preview.includes("2:new"), "buildCompactDiffPreview: mixed contains added line 2");
+  assert(p4.preview.includes("3:ctx"), "buildCompactDiffPreview: mixed contains ctx line 3");
+
+  const p5: CompactDiffPreview = buildCompactDiffPreview("+1|a\n+2|b\n+3|c\n+4|d\n+5|e\n+6|f");
+  assert(p5.preview.includes("…"), "buildCompactDiffPreview: 6 added → elision marker present");
+  assert(p5.preview.split("\n").length < 6, "buildCompactDiffPreview: 6 added → preview has fewer than 6 lines");
+  assertEq(p5.addedLines, 6, "buildCompactDiffPreview: 6 added → addedLines=6");
+}
+
+// ── Test 53: Seen lines tracking ─────────────────────────────────────────────
+console.log("\n─ Seen lines tracking ─");
+
+assertEq(JSON.stringify(parseSeenLinesFromHashlineBody("1:foo\n2:bar\n3:baz")), JSON.stringify([1, 2, 3]), "parseSeenLinesFromHashlineBody: 3 simple rows");
+assertEq(JSON.stringify(parseSeenLinesFromHashlineBody("1-5:content")), JSON.stringify([1, 5]), "parseSeenLinesFromHashlineBody: range row");
+assertEq(JSON.stringify(parseSeenLinesFromHashlineBody(" 3:indented")), JSON.stringify([3]), "parseSeenLinesFromHashlineBody: single space prefix");
+assertEq(JSON.stringify(parseSeenLinesFromHashlineBody("*7:starred")), JSON.stringify([7]), "parseSeenLinesFromHashlineBody: star prefix");
+assertEq(JSON.stringify(parseSeenLinesFromHashlineBody("not a line")), JSON.stringify([]), "parseSeenLinesFromHashlineBody: no match");
+assertEq(JSON.stringify(parseSeenLinesFromHashlineBody("")), JSON.stringify([]), "parseSeenLinesFromHashlineBody: empty");
+assertEq(JSON.stringify(parseSeenLinesFromHashlineBody("1:foo\nbar\n3:baz")), JSON.stringify([1, 3]), "parseSeenLinesFromHashlineBody: non-matching line skipped");
+
+assertEq(formatLineRanges([1, 2, 3, 4]), "1-4", "formatLineRanges: contiguous");
+assertEq(formatLineRanges([1, 3, 5]), "1, 3, 5", "formatLineRanges: scattered");
+assertEq(formatLineRanges([1, 2, 3, 7, 10, 11, 12]), "1-3, 7, 10-12", "formatLineRanges: mixed");
+assertEq(formatLineRanges([]), "", "formatLineRanges: empty");
+assertEq(formatLineRanges([5]), "5", "formatLineRanges: single");
+assertEq(formatLineRanges([3, 1, 2]), "1-3", "formatLineRanges: sorted + deduped");
+
+{
+  const msg = unseenLinesMessage("foo.ts", [5, 6], "1A2B");
+  assert(msg.includes("lines 5-6 of foo.ts"), "unseenLinesMessage: contains ranges and path");
+  assert(msg.includes("#1A2B"), "unseenLinesMessage: contains tag");
+  assert(msg.includes("Re-read"), "unseenLinesMessage: contains Re-read");
+}
+
+{
+  const seenPath = "/test/seen-lines-test.ts";
+  const text = "a\nb\nc\n";
+  const hash = snapshotStore.record(seenPath, text, new Set([1, 2, 3]));
+
+  const seen1 = assertSeenLines(
+    { path: seenPath, hash, edits: [{ kind: "swap", start: 1, end: 1, lines: ["x"] }] },
+    seenPath,
+    hash,
+  );
+  assertEq(seen1, null, "assertSeenLines: line 1 was seen → null");
+
+  const seen2 = assertSeenLines(
+    { path: seenPath, hash, edits: [{ kind: "swap", start: 5, end: 5, lines: ["x"] }] },
+    seenPath,
+    hash,
+  );
+  assert(seen2 !== null, "assertSeenLines: line 5 was NOT seen → error");
+
+  const seen3 = assertSeenLines(
+    { path: seenPath, hash: "0000", edits: [] },
+    seenPath,
+    "0000",
+  );
+  assertEq(seen3, null, "assertSeenLines: hash not found → null");
+}
+
+{
+  const freshStore = new SnapshotStore();
+  const p = "/test/record-seen-test.ts";
+  const h = freshStore.record(p, "a\nb\nc\n");
+  freshStore.recordSeenLines(p, h, [1, 2]);
+  const snap = freshStore.byHash(p, h);
+  assert(snap !== null, "SnapshotStore.recordSeenLines: snapshot exists");
+  assert(snap!.seenLines !== undefined, "SnapshotStore.recordSeenLines: seenLines populated");
+  assertEq(snap!.seenLines!.size, 2, "SnapshotStore.recordSeenLines: seenLines has 2 entries");
+  assert(snap!.seenLines!.has(1), "SnapshotStore.recordSeenLines: contains 1");
+  assert(snap!.seenLines!.has(2), "SnapshotStore.recordSeenLines: contains 2");
+}
+
+// ── Test 54: Noop loop guard ─────────────────────────────────────────────────
+console.log("\n─ Noop loop guard ─");
+
+{
+  const h1 = hashPatchInput("test");
+  assert(/^[a-f0-9]{32}$/.test(h1), `hashPatchInput: returns 32-char hex (got: ${h1})`);
+  assertEq(hashPatchInput("test"), hashPatchInput("test"), "hashPatchInput: deterministic");
+  assert(hashPatchInput("test") !== hashPatchInput("different"), "hashPatchInput: different input → different hash");
+}
+
+{
+  const sess1 = "test-sess-noop-1";
+  const path1 = "/test/file-noop-1.txt";
+  resetNoopEdit(sess1, path1);
+
+  const r1 = recordNoopEdit(sess1, path1, "abc");
+  assertEq(r1.count, 1, "recordNoopEdit: first call count=1");
+  assertEq(r1.escalate, false, "recordNoopEdit: first call no escalate");
+
+  const r2 = recordNoopEdit(sess1, path1, "abc");
+  assertEq(r2.count, 2, "recordNoopEdit: second call count=2");
+  assertEq(r2.escalate, false, "recordNoopEdit: second call no escalate");
+
+  const r3 = recordNoopEdit(sess1, path1, "abc");
+  assertEq(r3.count, 3, "recordNoopEdit: third call count=3");
+  assertEq(r3.escalate, true, "recordNoopEdit: third call escalate (NOOP_HARD_LIMIT=3)");
+
+  const r4 = recordNoopEdit(sess1, path1, "xyz");
+  assertEq(r4.count, 1, "recordNoopEdit: different input hash → reset count=1");
+  assertEq(r4.escalate, false, "recordNoopEdit: reset → no escalate");
+
+  const r5 = recordNoopEdit(sess1, "/test/other.txt", "abc");
+  assertEq(r5.count, 1, "recordNoopEdit: different path → separate count=1");
+  assertEq(r5.escalate, false, "recordNoopEdit: separate path → no escalate");
+
+  const sess2 = "test-sess-noop-2";
+  const r6 = recordNoopEdit(sess2, path1, "abc");
+  assertEq(r6.count, 1, "recordNoopEdit: different session → separate count=1");
+  assertEq(r6.escalate, false, "recordNoopEdit: separate session → no escalate");
+
+  const sess3 = "test-sess-noop-reset";
+  const path3 = "/test/file-noop-reset.txt";
+  recordNoopEdit(sess3, path3, "payload");
+  recordNoopEdit(sess3, path3, "payload");
+  resetNoopEdit(sess3, path3);
+  const r7 = recordNoopEdit(sess3, path3, "payload");
+  assertEq(r7.count, 1, "recordNoopEdit: reset → fresh count=1");
+  assertEq(r7.escalate, false, "recordNoopEdit: reset → no escalate");
+
+  resetNoopEdit("nonexistent-session-noop", "/file.txt");
+
+  const diag1 = noChangeDiagnostic("foo.ts");
+  assert(diag1.includes("foo.ts"), "noChangeDiagnostic: contains path");
+  assert(diag1.includes("no change") || diag1.includes("byte-identical"), "noChangeDiagnostic: contains no change / byte-identical");
+  assert(diag1.includes("re-read"), "noChangeDiagnostic: contains re-read");
+
+  const diag2 = noChangeLoopDiagnostic("foo.ts", 3);
+  assert(diag2.includes("foo.ts"), "noChangeLoopDiagnostic: contains path");
+  assert(diag2.includes("STOP"), "noChangeLoopDiagnostic: contains STOP");
+  assert(diag2.includes("3"), "noChangeLoopDiagnostic: contains count");
+
+  assertEq(NOOP_HARD_LIMIT, 3, "NOOP_HARD_LIMIT: equals 3");
 }
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
