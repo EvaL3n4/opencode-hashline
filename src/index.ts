@@ -12,6 +12,7 @@ interface Snapshot {
   text: string;
   hash: string;
   recordedAt: number;
+  seenLines?: Set<number>;
 }
 
 type EditOp =
@@ -41,6 +42,7 @@ interface CompactDiffPreview {
 }
 
 type EditContext = {
+  sessionID: string;
   worktree: string;
   metadata(input: { title?: string; metadata?: { [key: string]: any } }): void;
 };
@@ -99,14 +101,21 @@ const MAX_PATHS = 30;
 const MAX_VERSIONS_PER_PATH = 4;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
 
+function mergeSeenLines(snapshot: Snapshot, lines: Iterable<number> | undefined): void {
+  if (lines === undefined) return;
+  if (snapshot.seenLines === undefined) snapshot.seenLines = new Set<number>();
+  for (const line of lines) snapshot.seenLines.add(line);
+}
+
 class SnapshotStore {
   private store = new Map<string, Snapshot[]>();
   private totalBytes = 0;
 
-  record(path: string, text: string): string {
+  record(path: string, text: string, seenLines?: Iterable<number>): string {
     const normalized = normalizeForStorage(text);
     const hash = computeFileHash(normalized);
     const snapshot: Snapshot = { path, text: normalized, hash, recordedAt: Date.now() };
+    mergeSeenLines(snapshot, seenLines);
 
     let versions = this.store.get(path);
     if (!versions) {
@@ -117,6 +126,7 @@ class SnapshotStore {
     const existing = versions.find((s) => s.hash === hash);
     if (existing) {
       existing.recordedAt = Date.now();
+      mergeSeenLines(existing, seenLines);
       return hash;
     }
 
@@ -136,6 +146,13 @@ class SnapshotStore {
     const versions = this.store.get(path);
     if (!versions) return null;
     return versions.find((s) => s.hash === hash) ?? null;
+  }
+
+  recordSeenLines(path: string, hash: string, lines: Iterable<number>): void {
+    const versions = this.store.get(path);
+    if (!versions) return;
+    const snapshot = versions.find(s => s.hash === hash);
+    if (snapshot) mergeSeenLines(snapshot, lines);
   }
 
   head(path: string): Snapshot | null {
@@ -275,6 +292,19 @@ function unwrapHashlineHeaderPath(targetPath: string): string {
   return pathPart;
 }
 
+const HASHLINE_LINE_PREFIX = /^[ *]?(\d+)(?:-(\d+))?:/;
+
+function parseSeenLinesFromHashlineBody(body: string): number[] {
+  const seen: number[] = [];
+  for (const row of body.split("\n")) {
+    const match = HASHLINE_LINE_PREFIX.exec(row);
+    if (!match) continue;
+    seen.push(Number(match[1]));
+    if (match[2] !== undefined) seen.push(Number(match[2]));
+  }
+  return seen;
+}
+
 // ─── Call Tracking (tool.execute.before → after bridge) ──────────────────────
 
 interface CallInfo {
@@ -284,6 +314,57 @@ interface CallInfo {
 }
 
 const pendingCalls = new Map<string, CallInfo>();
+
+// ─── Noop Loop Guard ─────────────────────────────────────────────────────────
+
+interface NoopLoopEntry {
+  hash: string;
+  count: number;
+}
+
+const NOOP_HARD_LIMIT = 3;
+const noopGuards = new Map<string, Map<string, NoopLoopEntry>>();
+
+function hashPatchInput(input: string): string {
+  return createHash("md5").update(input).digest("hex");
+}
+
+function recordNoopEdit(sessionID: string, canonicalPath: string, inputHash: string): { count: number; escalate: boolean } {
+  let sessionGuard = noopGuards.get(sessionID);
+  if (!sessionGuard) {
+    sessionGuard = new Map();
+    noopGuards.set(sessionID, sessionGuard);
+  }
+  const prev = sessionGuard.get(canonicalPath);
+  const count = prev && prev.hash === inputHash ? prev.count + 1 : 1;
+  sessionGuard.set(canonicalPath, { hash: inputHash, count });
+  return { count, escalate: count >= NOOP_HARD_LIMIT };
+}
+
+function resetNoopEdit(sessionID: string, canonicalPath: string): void {
+  const sessionGuard = noopGuards.get(sessionID);
+  if (!sessionGuard) return;
+  sessionGuard.delete(canonicalPath);
+}
+
+function noChangeDiagnostic(path: string): string {
+  return (
+    `Edits to ${path} parsed and applied cleanly, but produced no change: ` +
+    `your body row(s) are byte-identical to the file at the targeted lines. ` +
+    `The bug is somewhere else — re-read the file before issuing another edit. ` +
+    `Do NOT widen the payload or add lines; verify the anchor first.`
+  );
+}
+
+function noChangeLoopDiagnostic(path: string, count: number): string {
+  return (
+    `STOP. Edits to ${path} have been a byte-identical no-op ${count} times in a row — ` +
+    `the patch body matches the file at the targeted lines and the soft hint did not break the cycle. ` +
+    `Cease re-issuing this payload. Either the intended change is already on disk (move on), ` +
+    `or your anchor is wrong (re-read the file with \`read\` to observe the current line numbers and ` +
+    `tag, then author a different edit). This exact payload will keep being rejected until it changes.`
+  );
+}
 
 // ─── Patch Parser ────────────────────────────────────────────────────────────
 
@@ -1175,6 +1256,44 @@ function formatAnchoredContext(anchorLines: readonly number[], fileLines: readon
   return rows;
 }
 
+function formatLineRanges(lines: readonly number[]): string {
+  const sorted = [...new Set(lines)].sort((a, b) => a - b);
+  if (sorted.length === 0) return "";
+  const parts: string[] = [];
+  let start = sorted[0]!;
+  let prev = sorted[0]!;
+  for (let i = 1; i <= sorted.length; i++) {
+    const current = sorted[i]!;
+    if (current === prev + 1) {
+      prev = current;
+      continue;
+    }
+    parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = current;
+    prev = current;
+  }
+  return parts.join(", ");
+}
+
+function unseenLinesMessage(sectionPath: string, unseenLines: readonly number[], tag: string): string {
+  const ranges = formatLineRanges(unseenLines);
+  return (
+    `This edit anchors to lines ${ranges} of ${sectionPath} that ` +
+    `#${tag} never displayed (it showed a partial range, a search hit, or a folded summary). ` +
+    `Re-read them in full first with a ranged read like \`${sectionPath}:${ranges.replace(/, /g, ",")}\` — ` +
+    `it skips summarization and mints a fresh tag (a plain re-read just re-folds them) — then re-issue the edit.`
+  );
+}
+
+function assertSeenLines(section: PatchSection, canonical: string, expected: string): string | null {
+  const seen = snapshotStore.byHash(canonical, expected)?.seenLines;
+  if (!seen || seen.size === 0) return null;
+  const anchorLines = collectAnchorLines(section.edits);
+  const unseen = anchorLines.filter(line => !seen.has(line));
+  if (unseen.length === 0) return null;
+  return unseenLinesMessage(section.path, unseen, expected);
+}
+
 interface MismatchDetails {
   path: string;
   expectedHash: string;
@@ -1312,6 +1431,9 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
       }
     }
 
+    const seenError = assertSeenLines(section, canonical, section.hash);
+    if (seenError) return { output: `Error: ${seenError}` };
+
     const fileLines = normalized.split("\n");
     const boundsError = validateLineBounds(section.edits, fileLines);
     if (boundsError) {
@@ -1323,6 +1445,18 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
     prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: repairWarnings });
   }
 
+  const inputHash = hashPatchInput(args.input);
+  for (const entry of prepared) {
+    if (entry.newText === entry.oldText) {
+      const canonical = canonicalPath(entry.path);
+      const { count, escalate } = recordNoopEdit(context.sessionID, canonical, inputHash);
+      if (escalate) {
+        return { output: noChangeLoopDiagnostic(entry.path, count) };
+      }
+      return { output: noChangeDiagnostic(entry.path) };
+    }
+  }
+
   const results: string[] = [];
   const filediffs: FileDiffMetadata[] = [];
 
@@ -1330,6 +1464,7 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
     const restored = entry.bom + restoreLineEndings(entry.newText, entry.lineEnding);
     writeFileSync(entry.path, restored);
     const canonical = canonicalPath(entry.path);
+    resetNoopEdit(context.sessionID, canonical);
     const newHash = snapshotStore.record(canonical, entry.newText);
 
     const { additions, deletions } = lineDiff(entry.oldText, entry.newText);
@@ -1478,6 +1613,10 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
         const canonical = canonicalPath(callInfo.filePath);
         const rawContent = callInfo.rawContent ?? "";
         const hash = snapshotStore.record(canonical, rawContent);
+        const seenLines = parseSeenLinesFromHashlineBody(output.output ?? "");
+        if (seenLines.length > 0) {
+          snapshotStore.recordSeenLines(canonical, hash, seenLines);
+        }
         output.output = `[${callInfo.filePath}#${hash}]\n${output.output}`;
       }
 
@@ -1532,7 +1671,10 @@ export {
   findOneSidedBoundaryEcho, bodyTargetIndent, resolveShiftedLanding, repairEdits,
   hasAnchorScopedEdit, collectAnchorLines, verifyAnchorContent, findFirstChangedLine,
   applyEditsToSnapshot, replaySessionChainOnCurrent, tryRecover,
-  formatAnchoredContext, formatMismatchError,
+  formatAnchoredContext, formatMismatchError, MismatchError,
+  parseSeenLinesFromHashlineBody, formatLineRanges, unseenLinesMessage, assertSeenLines,
+  hashPatchInput, recordNoopEdit, resetNoopEdit,
+  noChangeDiagnostic, noChangeLoopDiagnostic, NOOP_HARD_LIMIT,
   HEADTAIL_DRIFT_WARNING, RECOVERY_EXTERNAL_WARNING,
   RECOVERY_SESSION_CHAIN_WARNING, RECOVERY_SESSION_REPLAY_WARNING,
   MISMATCH_CONTEXT,
