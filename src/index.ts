@@ -190,6 +190,57 @@ function relativePath(from: string, to: string): string {
   return rel || to;
 }
 
+const HL_PREFIX_RE = /^\s*(?:>>>|>>)?\s*(?:[+*-]\s*)?\d+:/;
+const HL_HEADER_RE = /^\s*\[[^#\r\n]+#[0-9a-fA-F]{4}\]\s*$/;
+const READ_TRUNCATION_NOTICE_RE = /^\[(?:Showing lines \d+-\d+ of \d+|\d+ more lines? in (?:file|\S+))\b.*\bUse :L?\d+/;
+
+function stripLeadingHashlinePrefix(line: string): string {
+  return line.replace(HL_PREFIX_RE, "");
+}
+
+function stripHashlinePrefixes(lines: string[]): string[] {
+  let nonEmpty = 0, headerCount = 0, hashPrefixCount = 0;
+  for (const line of lines) {
+    if (line.length === 0) continue;
+    if (READ_TRUNCATION_NOTICE_RE.test(line)) continue;
+    if (HL_HEADER_RE.test(line)) { nonEmpty++; headerCount++; continue; }
+    nonEmpty++;
+    if (HL_PREFIX_RE.test(line)) hashPrefixCount++;
+  }
+  if (nonEmpty === 0) return lines;
+  const contentLineCount = nonEmpty - headerCount;
+  if (contentLineCount === 0 || hashPrefixCount !== contentLineCount) return lines;
+  return lines
+    .filter(line => !READ_TRUNCATION_NOTICE_RE.test(line) && !HL_HEADER_RE.test(line))
+    .map(line => stripLeadingHashlinePrefix(line));
+}
+
+function stripWriteContent(content: string): string {
+  const lines = content.split("\n");
+  const cleaned = stripHashlinePrefixes(lines);
+  if (cleaned !== lines) return cleaned.join("\n");
+  const headerIndex = lines.findIndex(line => line.trim().length > 0);
+  if (headerIndex === -1) return content;
+  const headerLine = lines[headerIndex]!;
+  if (!HL_HEADER_RE.test(headerLine)) return content;
+  const withoutHeader = lines.slice(0, headerIndex).concat(lines.slice(headerIndex + 1));
+  const cleanedWithoutHeader = stripHashlinePrefixes(withoutHeader);
+  if (cleanedWithoutHeader === withoutHeader) return content;
+  return cleanedWithoutHeader.join("\n");
+}
+
+function unwrapHashlineHeaderPath(targetPath: string): string {
+  const trimmed = targetPath.trimEnd();
+  if (trimmed.length < 3 || trimmed[0] !== "[" || trimmed[trimmed.length - 1] !== "]") {
+    return targetPath;
+  }
+  const inner = trimmed.slice(1, -1);
+  const tagMatch = /#[0-9a-fA-F]{4}$/.exec(inner);
+  const pathPart = tagMatch ? inner.slice(0, tagMatch.index) : inner;
+  if (pathPart.length === 0 || pathPart.includes("#")) return targetPath;
+  return pathPart;
+}
+
 // ─── Call Tracking (tool.execute.before → after bridge) ──────────────────────
 
 interface CallInfo {
@@ -202,6 +253,28 @@ const pendingCalls = new Map<string, CallInfo>();
 
 // ─── Patch Parser ────────────────────────────────────────────────────────────
 
+function detectContamination(text: string): string | null {
+  const trimmed = text.trimStart();
+  if (trimmed.length === 0) return null;
+  if (
+    trimmed.startsWith("*** Update File:") ||
+    trimmed.startsWith("*** Add File:") ||
+    trimmed.startsWith("*** Delete File:") ||
+    trimmed.startsWith("*** Move to:")
+  ) {
+    const preview = trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed;
+    return `apply_patch sentinel ${JSON.stringify(preview)} is not valid in hashline. File sections start with \`[path#HASH]\` (no \`Update File:\` / \`Add File:\` keyword). Use \`SWAP N.=M:\`, \`DEL N.=M\`, or \`INS.PRE|POST|HEAD|TAIL:\` ops.`;
+  }
+  if (/^@@\s+[-+]?\d+,\d+\s+[-+]?\d+,\d+\s+@@/.test(trimmed)) {
+    return "unified-diff hunk header (`@@ -N,M +N,M @@`) is not valid in hashline. Use `SWAP N.=M:`, `DEL N.=M`, or `INS.PRE|POST|HEAD|TAIL:` ops.";
+  }
+  if (trimmed.startsWith("@@")) {
+    const preview = trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed;
+    return `\`@@\`-bracketed hunk header ${JSON.stringify(preview)} is not valid in hashline. Drop the \`@@ ... @@\` brackets and write a verb header such as \`SWAP N.=M:\`.`;
+  }
+  return null;
+}
+
 function parsePatch(input: string): PatchSection[] {
   const sections: PatchSection[] = [];
   const lines = input.split("\n");
@@ -211,6 +284,7 @@ function parsePatch(input: string): PatchSection[] {
 
   for (const line of lines) {
     if (line.startsWith("*** Begin Patch") || line.startsWith("*** End Patch")) continue;
+    if (line.startsWith("*** Abort")) break;
 
     const headerMatch = line.match(/^\[([^\]]+)#([0-9A-Fa-f]{4})\]\s*$/);
     if (headerMatch) {
@@ -229,6 +303,10 @@ function parsePatch(input: string): PatchSection[] {
     if (bodyTarget !== null && line.startsWith("+")) {
       bodyTarget.push(line.slice(1));
       continue;
+    }
+
+    if (bodyTarget !== null && line.startsWith("-")) {
+      throw new Error("`-` rows are not valid; the range already names the lines being changed. For a literal `-` line, write `+-…`.");
     }
 
     bodyTarget = null;
@@ -289,10 +367,24 @@ function parsePatch(input: string): PatchSection[] {
       };
       currentSection.edits.push(edit);
       bodyTarget = edit.lines;
+    } else {
+      const contamination = detectContamination(line);
+      if (contamination) {
+        throw new Error(contamination);
+      }
     }
   }
 
   if (currentSection) sections.push(currentSection);
+
+  for (const section of sections) {
+    for (const edit of section.edits) {
+      if (edit.kind === "swap" && edit.lines.length === 0) {
+        throw new Error("`SWAP N.=M:` needs at least one `+TEXT` body row. To delete lines, use `DEL N.=M`.");
+      }
+    }
+  }
+
   return sections;
 }
 
@@ -895,7 +987,12 @@ function formatMismatchError(details: MismatchDetails): string {
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
 
 async function executeHashlineEdit(args: { input: string }, context: EditContext): Promise<ToolResult> {
-  const sections = parsePatch(args.input);
+  let sections: PatchSection[];
+  try {
+    sections = parsePatch(args.input);
+  } catch (e) {
+    return { output: `Error: ${(e as Error).message}` };
+  }
   if (sections.length === 0) {
     return { output: "Error: no valid patch sections found. Expected [PATH#TAG] header followed by operations." };
   }
@@ -1084,13 +1181,17 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
       }
 
       if (input.tool === "write") {
-        const filePath = output.args?.filePath;
-        if (filePath) {
+        const rawFilePath = output.args?.filePath;
+        if (rawFilePath) {
+          const filePath = unwrapHashlineHeaderPath(rawFilePath);
+          const writeContent = stripWriteContent(output.args?.content ?? "");
           const callInfo: CallInfo = {
             filePath,
-            writeContent: output.args?.content ?? "",
+            writeContent,
           };
           pendingCalls.set(input.callID, callInfo);
+          output.args.filePath = filePath;
+          output.args.content = writeContent;
         }
       }
     },

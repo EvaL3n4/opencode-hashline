@@ -94,7 +94,7 @@ Range separator `.=` accepts variants: `-`, `..`, `…`, `=`, whitespace
    - **Recovery fails** → hard reject with actionable error ("re-read the file to refresh tag")
 5. **All-or-nothing commit**: preflight all sections in memory before writing any
 
-**Deferred to v2**: `seenLines` tracking, block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST).
+**Deferred to v2**: `seenLines` tracking, block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST), noop-loop guard, write tool hashline integration, search tool hashline mode, streaming diff preview, tokenizer refactor, header recovery, parser contamination detection. See beads for full v2 scope.
 
 ### Edit Tool Return Format
 
@@ -139,14 +139,38 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 
 ### v2 (deferred)
 
-- Block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST) — requires tree-sitter
+**Completed:**
 - ~~3-way merge recovery (apply edit to snapshot, diff, merge to current)~~ ✅ Done
 - ~~Session-chain replay (apply to current with anchor-content guards)~~ ✅ Done
 - ~~Head/tail drift tolerance (INS.HEAD/INS.TAIL despite stale tag)~~ ✅ Done
-- `seenLines` tracking (reject edits to lines never displayed)
 - ~~Boundary repair (auto-fix model's off-by-one mistakes)~~ ✅ Done
-- `experimental.session.compacting` hook (inject snapshot table for DCP survival)
-- npm publish
+
+**In progress (beads):**
+- `seenLines` tracking (reject edits to lines never displayed) — `q67`
+- Noop detection + loop guard — `ys1`
+
+**Ready (beads):**
+- Block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST) — requires tree-sitter — `3tu`
+- DCP compaction survival (`experimental.session.compacting` hook) — `65v`
+- Compact diff preview (post-edit line numbers for chaining) — `ci5`
+- Multi-section duplicate path detection — `tpk`
+- Write tool hashline integration (strip prefixes, echo tag, unwrap path) — `wyv`
+- Header recovery (strip apply_patch noise from headers) — `8se`
+- Parser contamination detection (reject `@@`/`-`/sentinels) — `2rh`
+- Line bounds validation — `7kz`
+- Trailing phantom line handling — `xso`
+- canonicalPath for non-existing files — `jy7`
+- Boundary repair 2-pass — `2k9`
+- Tokenizer (char-level state machine) — `8dy`
+- MismatchError class — `dkj`
+
+**Blocked (beads):**
+- System prompt expansion (depends on `q67` + `3tu`) — `dua`
+- Streaming diff preview (depends on `8dy`) — `25c`
+- Search/grep tool hashline mode (depends on `q67`) — `7id`
+
+**Final:**
+- npm publish — `10r` (gated on all above)
 
 ## Development
 
@@ -183,18 +207,52 @@ Manual testing in OpenCode sessions:
 
 Research clone at `~/research/oh-my-pi`. Key files studied:
 
+**`packages/hashline/src/` (core library, 20 files):**
+
 | File | Role |
 |---|---|
-| `packages/hashline/src/format.ts` | Hash computation (`computeFileHash` at line 108) |
-| `packages/hashline/src/snapshots.ts` | InMemorySnapshotStore |
-| `packages/hashline/src/patcher.ts` | Core Patcher (prepare/commit/recovery) |
-| `packages/hashline/src/recovery.ts` | 3-way merge + session-chain replay (v2 ref) |
-| `packages/hashline/src/parser.ts` | Patch parser (state machine) |
-| `packages/hashline/src/apply.ts` | Edit application with boundary repair |
-| `packages/hashline/src/prompt.md` | System prompt text (adapted for our v1) |
-| `packages/coding-agent/src/edit/hashline/execute.ts` | Edit tool → hashline driver |
-| `packages/coding-agent/src/tools/read.ts` | Read tool + snapshot recording |
-| `packages/coding-agent/src/tools/write.ts` | Write tool + hashline stripping |
+| `format.ts` | Hash computation (`computeFileHash`), normalization |
+| `normalize.ts` | BOM strip, line-ending detect/restore |
+| `snapshots.ts` | `InMemorySnapshotStore` with `seenLines` tracking |
+| `types.ts` | Core types: `Snapshot`, `BlockResolver`, `BlockSpan`, `EditOp` |
+| `tokenizer.ts` | Char-level `Tokenizer` class (feed/end/reset, streaming) |
+| `parser.ts` | `Executor` state machine, `parsePatch`/`parsePatchStreaming`, contamination detection |
+| `input.ts` | `Patch` class with lazy parse, `mergeSamePathSections`, header recovery |
+| `apply.ts` | Edit application, 2-pass boundary repair, phantom line, line-bounds validation |
+| `block.ts` | `BlockResolver` impl, `SWAP.BLK`/`DEL.BLK`/`INS.BLK.POST` resolution |
+| `recovery.ts` | 3-way merge + session-chain replay, `Recovery` class |
+| `mismatch.ts` | `MismatchError` class with structured `rejectionHeader` |
+| `messages.ts` | `formatAnchoredContext`, block-unresolved/single-line messages, `MINUS_ROW_REJECTED` |
+| `prefixes.ts` | `stripNewLinePrefixes`/`stripHashlinePrefixes` (for write tool) |
+| `stream.ts` | `streamHashLines` async generator (byte-level streaming reads) |
+| `diff-preview.ts` | `buildCompactDiffPreview` (post-edit line numbers) |
+| `patcher.ts` | High-level `Patcher` (prepare/commit/preflight, `assertSeenLines`, `assertUniqueCanonicalPaths`) |
+| `fs.ts` | `Filesystem` abstraction (`NodeFilesystem`/`InMemoryFilesystem`) |
+| `prompt.md` | System prompt text (140 lines, block ops, anti-patterns) |
+| `grammar.lark` | Lark grammar spec (reference) |
+| `index.ts` | Package barrel export |
+
+**`packages/coding-agent/src/edit/hashline/` (agent integration, 7 files):**
+
+| File | Role |
+|---|---|
+| `execute.ts` | Edit tool → hashline driver, `noChangeDiagnostic` |
+| `block-resolver.ts` | Tree-sitter `BlockResolver` via `@oh-my-pi/pi-natives` |
+| `diff.ts` | `buildStreamingSectionDiff` (live preview while model types) |
+| `filesystem.ts` | `writethrough`, `resolvePlanPath`, `assertEditableFileContent` |
+| `noop-loop-guard.ts` | `NOOP_HARD_LIMIT=3`, escalating soft→hard rejection |
+| `params.ts` | Arktype schema with `_input` alias |
+| `index.ts` | Barrel export |
+
+**`packages/coding-agent/src/tools/` (hashline-aware tools):**
+
+| File | Role |
+|---|---|
+| `read.ts` | Read tool + snapshot recording + `seenLines` from displayed lines + summary hash context |
+| `write.ts` | Write tool + `stripWriteContent` + `maybeWriteSnapshotHeader` + `unwrapHashlineHeaderPath` |
+| `conflict-detect.ts` | Git merge conflict detection (`scanConflictLines`, `@ours`/`@theirs`/`@base`/`@both` tokens) |
+| `search.ts` | Search tool hashline mode + `recordSeenLinesFromBody` |
+| `match-line-format.ts` | `formatMatchLine({useHashLines})` for grep output |
 
 **Critical difference from oh-my-pi**: oh-my-pi has its own coding agent with its own hook system (`ExtensionRunner`/`HookRunner`). Hashline is a built-in library there, not an OpenCode plugin. We adapt the concepts to OpenCode's plugin API.
 
@@ -313,7 +371,7 @@ Key benchmark results (16 models, 3 edit tools, 180 tasks × 3 runs):
 
 - TypeScript, single-file for v1 (`src/index.ts`)
 - No comments unless requested
-- Match oh-my-pi's hash algorithm exactly for compatibility
+- Hash algorithm differs from oh-my-pi (MD5 vs xxHash32 via `Bun.hash`); both produce 16-bit 4-hex tags but are not interchangeable across runtimes—each is self-contained
 - Em dashes unspaced (—) in all prose
 - Plugin loads as local `.ts` file (no build step needed—OpenCode uses Bun)
 
