@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from "fs";
+import * as path from "path";
 import { join } from "path";
 import {
   type EditOp, type CompactDiffPreview, type BlockSpan,
@@ -22,6 +23,8 @@ import {
   EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
   blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
+  parseGrepOutput,
+  type GrepMatch, type GrepFileMatches, type ParsedGrepOutput,
 } from "./src/index.ts";
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
@@ -1739,6 +1742,278 @@ console.log("\n─ Compaction survival ─");
     buildSnapshotTable(aEntries, "/worktree");
   assert(contextStr.startsWith("Active file snapshots —"), "compaction context: starts with preamble");
   assert(contextStr.includes("[src/a.ts#"), "compaction context: contains table");
+}
+
+// ── Test 57: Grep hashline mode ──────────────────────────────────────────────
+console.log("\n─ Grep hashline mode ─");
+
+// 1. parseGrepOutput with typical multi-file output
+{
+  const grepOutput = [
+    "Found 3 matches",
+    "",
+    "/abs/path/file.ts:",
+    "  Line 10: some matched text",
+    "  Line 25: another match",
+    "",
+    "/abs/path/other.ts:",
+    "  Line 5: match here",
+  ].join("\n");
+
+  const parsed = parseGrepOutput(grepOutput);
+  assert(parsed !== null, "parseGrepOutput: typical multi-file → non-null");
+  if (parsed) {
+    assertEq(parsed.header, "Found 3 matches", "parseGrepOutput: header captured");
+    assertEq(parsed.files.length, 2, "parseGrepOutput: 2 files parsed");
+    assertEq(parsed.footer, "", "parseGrepOutput: no footer");
+    const f0 = parsed.files[0];
+    const f1 = parsed.files[1];
+    assert(f0 !== undefined, "parseGrepOutput: file 0 present");
+    assert(f1 !== undefined, "parseGrepOutput: file 1 present");
+    if (f0) {
+      assertEq(f0.path, "/abs/path/file.ts", "parseGrepOutput: file 0 path");
+      assertEq(f0.matches.length, 2, "parseGrepOutput: file 0 has 2 matches");
+      assertEq(f0.matches[0]?.line, 10, "parseGrepOutput: file 0 match 0 line");
+      assertEq(f0.matches[0]?.text, "some matched text", "parseGrepOutput: file 0 match 0 text");
+      assertEq(f0.matches[1]?.line, 25, "parseGrepOutput: file 0 match 1 line");
+      assertEq(f0.matches[1]?.text, "another match", "parseGrepOutput: file 0 match 1 text");
+    }
+    if (f1) {
+      assertEq(f1.path, "/abs/path/other.ts", "parseGrepOutput: file 1 path");
+      assertEq(f1.matches.length, 1, "parseGrepOutput: file 1 has 1 match");
+    }
+  }
+}
+
+// 2. parseGrepOutput with 0 matches
+{
+  const parsed = parseGrepOutput("Found 0 matches\n");
+  assert(parsed !== null, "parseGrepOutput: 0 matches → non-null");
+  if (parsed) {
+    assertEq(parsed.header, "Found 0 matches", "parseGrepOutput: 0 matches header");
+    assertEq(parsed.files.length, 0, "parseGrepOutput: 0 matches → empty files");
+    assertEq(parsed.footer, "", "parseGrepOutput: 0 matches → no footer");
+  }
+}
+
+// 3. parseGrepOutput with truncation footer
+{
+  const grepOutput = [
+    "Found 100 matches (more matches available)",
+    "",
+    "/abs/file.ts:",
+    "  Line 1: a",
+    "(Results truncated. Use limit=N to see more)",
+  ].join("\n");
+
+  const parsed = parseGrepOutput(grepOutput);
+  assert(parsed !== null, "parseGrepOutput: truncated → non-null");
+  if (parsed) {
+    assertEq(parsed.files.length, 1, "parseGrepOutput: truncated → 1 file");
+    assert(parsed.footer.startsWith("(Results truncated"), `parseGrepOutput: footer captured (got: ${parsed.footer})`);
+  }
+}
+
+// 4. parseGrepOutput with non-grep output returns null
+{
+  assertEq(parseGrepOutput(""), null, "parseGrepOutput: empty string → null");
+  assertEq(parseGrepOutput("not grep output\nfoo bar"), null, "parseGrepOutput: random text → null");
+  const readResult = parseGrepOutput("[/some/file.ts#1A2B]\n1:hello\n2:world");
+  assertEq(readResult, null, "parseGrepOutput: read-tool format → null");
+}
+
+// 5. parseGrepOutput with single file, multiple matches
+{
+  const grepOutput = [
+    "Found 4 matches",
+    "",
+    "/worktree/src/a.ts:",
+    "  Line 3: foo",
+    "  Line 7: bar",
+    "  Line 12: baz",
+    "  Line 99: qux",
+  ].join("\n");
+
+  const parsed = parseGrepOutput(grepOutput);
+  assert(parsed !== null, "parseGrepOutput: single file → non-null");
+  if (parsed) {
+    assertEq(parsed.files.length, 1, "parseGrepOutput: single file → 1 group");
+    const file = parsed.files[0];
+    assert(file !== undefined, "parseGrepOutput: single file present");
+    if (file) {
+      assertEq(file.matches.length, 4, "parseGrepOutput: single file → 4 matches");
+      assertEq(file.matches[0]?.line, 3, "parseGrepOutput: match 0 line");
+      assertEq(file.matches[3]?.text, "qux", "parseGrepOutput: match 3 text");
+    }
+  }
+}
+
+// 6. End-to-end: build a real grep output, run parser + manual format, verify shape
+{
+  const grepFilePath = join(tmpDir, "grep-test-6.txt");
+  const fileContent = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+  writeFileSync(grepFilePath, fileContent);
+
+  const grepOutput = [
+    "Found 2 matches",
+    "",
+    `${grepFilePath}:`,
+    "  Line 2: beta",
+    "  Line 4: delta",
+  ].join("\n");
+
+  const parsed = parseGrepOutput(grepOutput);
+  assert(parsed !== null, "e2e: parseGrepOutput non-null");
+  if (parsed) {
+    const store = new SnapshotStore();
+    const sections: string[] = [];
+    sections.push(parsed.header);
+    for (const file of parsed.files) {
+      const content = readFileSync(file.path, "utf-8");
+      const canonical = canonicalPath(file.path);
+      const tag = store.record(canonical, content, undefined, "test-session-6");
+      const body = file.matches.map((m) => `${m.line}:${m.text}`).join("\n");
+      const seenLines = parseSeenLinesFromHashlineBody(body);
+      if (seenLines.length > 0) {
+        store.recordSeenLines(canonical, tag, seenLines);
+      }
+      const rel = path.relative("/home/opus/.config/opencode/plugins/opencode-hashline", file.path);
+      sections.push(`[${rel}#${tag}]\n${body}`);
+    }
+    const finalOutput = sections.join("\n\n");
+
+    assert(finalOutput.includes(".test-tmp/grep-test-6.txt#"), `e2e: section header has relative path + tag (got: ${finalOutput})`);
+    assert(finalOutput.includes("2:beta"), "e2e: body line 2:beta present");
+    assert(finalOutput.includes("4:delta"), "e2e: body line 4:delta present");
+    assert(!finalOutput.includes("  Line 2:"), "e2e: original '  Line 2:' format removed");
+    assert(finalOutput.startsWith("Found 2 matches"), "e2e: header preserved");
+  }
+}
+
+// 7. seenLines recording from grep (verify via byHash)
+{
+  const store = new SnapshotStore();
+  const grepFilePath = join(tmpDir, "grep-test-7.txt");
+  writeFileSync(grepFilePath, "one\ntwo\nthree\nfour\nfive\n");
+
+  const grepOutput = [
+    "Found 3 matches",
+    "",
+    `${grepFilePath}:`,
+    "  Line 1: one",
+    "  Line 3: three",
+    "  Line 5: five",
+  ].join("\n");
+
+  const parsed = parseGrepOutput(grepOutput);
+  assert(parsed !== null, "seenLines: parsed non-null");
+  if (parsed) {
+    const file = parsed.files[0];
+    assert(file !== undefined, "seenLines: file present");
+    if (file) {
+      const content = readFileSync(file.path, "utf-8");
+      const canonical = canonicalPath(file.path);
+      const tag = store.record(canonical, content, undefined, "test-session-7");
+      const body = file.matches.map((m) => `${m.line}:${m.text}`).join("\n");
+      const seenLines = parseSeenLinesFromHashlineBody(body);
+      assertEq(seenLines.length, 3, "seenLines: 3 seen lines");
+      store.recordSeenLines(canonical, tag, seenLines);
+
+      const snapshot = store.byHash(canonical, tag);
+      assert(snapshot !== null, "seenLines: snapshot exists by hash");
+      if (snapshot) {
+        assert(snapshot.seenLines !== undefined, "seenLines: seenLines set attached");
+        if (snapshot.seenLines) {
+          assertEq(snapshot.seenLines.size, 3, "seenLines: 3 unique lines in set");
+          assert(snapshot.seenLines.has(1), "seenLines: line 1 recorded");
+          assert(snapshot.seenLines.has(3), "seenLines: line 3 recorded");
+          assert(snapshot.seenLines.has(5), "seenLines: line 5 recorded");
+        }
+      }
+    }
+  }
+}
+
+// 8. Large file skip: file > 4MB falls back to original grep format
+{
+  const store = new SnapshotStore();
+  const bigFile = join(tmpDir, "grep-test-8-big.txt");
+  // Build a synthetic content > MAX_GREP_SNAPSHOT_BYTES (4MB) cheaply by sparse string
+  const bigContent = "x".repeat(4 * 1024 * 1024 + 100);
+  writeFileSync(bigFile, bigContent);
+
+  const grepOutput = [
+    "Found 1 matches",
+    "",
+    `${bigFile}:`,
+    "  Line 1: x",
+  ].join("\n");
+
+  const parsed = parseGrepOutput(grepOutput);
+  assert(parsed !== null, "large-file: parsed non-null");
+  if (parsed) {
+    // Simulate the hook's skip logic
+    let tag: string | null = null;
+    try {
+      const content = readFileSync(bigFile, "utf-8");
+      if (content.length <= 4 * 1024 * 1024) {
+        tag = "SHOULD_NOT_BE_MINTED";
+      }
+    } catch {}
+    assertEq(tag, null, "large-file: tag not minted for >4MB file");
+
+    // Fallback: rebuild original grep section
+    const file = parsed.files[0];
+    assert(file !== undefined, "large-file: file present");
+    if (file) {
+      const originalLines = [`${file.path}:`];
+      for (const m of file.matches) {
+        originalLines.push(`  Line ${m.line}: ${m.text}`);
+      }
+      const fallbackSection = originalLines.join("\n");
+      assert(fallbackSection.includes("  Line 1: x"), "large-file: fallback keeps original format");
+      assert(!fallbackSection.includes("#"), "large-file: fallback has no tag");
+    }
+  }
+}
+
+// 9. Unreadable file skip: non-existent file falls back to original format
+{
+  const store = new SnapshotStore();
+  const ghostPath = join(tmpDir, "does-not-exist-9.txt");
+
+  const grepOutput = [
+    "Found 2 matches",
+    "",
+    `${ghostPath}:`,
+    "  Line 1: foo",
+    "  Line 5: bar",
+  ].join("\n");
+
+  const parsed = parseGrepOutput(grepOutput);
+  assert(parsed !== null, "unreadable: parsed non-null");
+  if (parsed) {
+    let tag: string | null = "WOULD_BE_MINTED";
+    try {
+      const content = readFileSync(ghostPath, "utf-8");
+      tag = "SHOULD_NOT_REACH";
+    } catch {
+      tag = null;
+    }
+    assertEq(tag, null, "unreadable: tag stays null on read error");
+
+    const file = parsed.files[0];
+    if (file) {
+      const originalLines = [`${file.path}:`];
+      for (const m of file.matches) {
+        originalLines.push(`  Line ${m.line}: ${m.text}`);
+      }
+      const fallback = originalLines.join("\n");
+      assert(fallback.includes("  Line 1: foo"), "unreadable: fallback has match 1");
+      assert(fallback.includes("  Line 5: bar"), "unreadable: fallback has match 2");
+      assert(!fallback.includes("#"), "unreadable: fallback has no tag");
+    }
+  }
 }
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────

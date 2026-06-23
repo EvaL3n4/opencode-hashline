@@ -108,6 +108,7 @@ function computeFileHash(text: string): string {
 const MAX_PATHS = 30;
 const MAX_VERSIONS_PER_PATH = 4;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const MAX_GREP_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 
 function mergeSeenLines(snapshot: Snapshot, lines: Iterable<number> | undefined): void {
   if (lines === undefined) return;
@@ -329,6 +330,73 @@ function parseSeenLinesFromHashlineBody(body: string): number[] {
     if (match[2] !== undefined) seen.push(Number(match[2]));
   }
   return seen;
+}
+
+// ─── Grep Output Parsing ─────────────────────────────────────────────────────
+
+interface GrepMatch {
+  line: number;
+  text: string;
+}
+
+interface GrepFileMatches {
+  path: string;
+  matches: GrepMatch[];
+}
+
+interface ParsedGrepOutput {
+  header: string;
+  files: GrepFileMatches[];
+  footer: string;
+}
+
+function parseGrepOutput(output: string): ParsedGrepOutput | null {
+  const lines = output.split("\n");
+  if (lines.length === 0) return null;
+
+  const first = lines[0];
+  if (first === undefined) return null;
+  const headerMatch = /^Found (\d+) matches/.exec(first);
+  if (!headerMatch) return null;
+
+  const header = first;
+  const files: GrepFileMatches[] = [];
+  let footer = "";
+
+  let i = 1;
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+    if (line === "") {
+      i++;
+      continue;
+    }
+
+    const fileMatch = /^(\/.+):$/.exec(line);
+    if (fileMatch) {
+      const filePath = fileMatch[1] ?? "";
+      if (filePath === "") { i++; continue; }
+      const matches: GrepMatch[] = [];
+      i++;
+      while (i < lines.length) {
+        const matchLine = /^  Line (\d+): (.*)$/.exec(lines[i] ?? "");
+        if (!matchLine) break;
+        matches.push({ line: Number(matchLine[1] ?? "0"), text: matchLine[2] ?? "" });
+        i++;
+      }
+      files.push({ path: filePath, matches });
+      continue;
+    }
+
+    if (/^\(Results truncated/.test(line)) {
+      footer = line;
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  return { header, files, footer };
 }
 
 // ─── Call Tracking (tool.execute.before → after bridge) ──────────────────────
@@ -2025,6 +2093,45 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
           output.output = `[${callInfo.filePath}#${hash}]`;
         }
       }
+
+      if (input.tool === "grep") {
+        const parsed = parseGrepOutput(output.output ?? "");
+        if (parsed && parsed.files.length > 0) {
+          const sections: string[] = [];
+          if (parsed.header) sections.push(parsed.header);
+
+          for (const file of parsed.files) {
+            let tag: string | null = null;
+            let canonical = "";
+            try {
+              const content = readFileSync(file.path, "utf-8");
+              if (content.length <= MAX_GREP_SNAPSHOT_BYTES) {
+                canonical = canonicalPath(file.path);
+                tag = snapshotStore.record(canonical, content, undefined, input.sessionID);
+              }
+            } catch {}
+
+            if (tag) {
+              const rel = worktree ? path.relative(worktree, file.path) : file.path;
+              const body = file.matches.map((m) => `${m.line}:${m.text}`).join("\n");
+              const seenLines = parseSeenLinesFromHashlineBody(body);
+              if (seenLines.length > 0) {
+                snapshotStore.recordSeenLines(canonical, tag, seenLines);
+              }
+              sections.push(`[${rel}#${tag}]\n${body}`);
+            } else {
+              const originalLines = [`${file.path}:`];
+              for (const m of file.matches) {
+                originalLines.push(`  Line ${m.line}: ${m.text}`);
+              }
+              sections.push(originalLines.join("\n"));
+            }
+          }
+
+          if (parsed.footer) sections.push(parsed.footer);
+          output.output = sections.join("\n\n");
+        }
+      }
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -2100,6 +2207,8 @@ export {
   EXTENSION_TO_WASM, hasBlockEdit, resolveBlockEdits, resolveBlock, resolveBlockSpan,
   blockUnresolvedMessage, blockSingleLineMessage, BLOCK_RESOLVER_UNAVAILABLE,
   insertAfterBlockCloserLoweredWarning, insertAfterBlockUnresolvedLoweredWarning,
+  parseGrepOutput,
+  type GrepMatch, type GrepFileMatches, type ParsedGrepOutput,
 };
 export default HashlinePlugin;
 export { HashlinePlugin };
