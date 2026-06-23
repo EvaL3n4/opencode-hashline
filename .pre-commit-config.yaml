@@ -1,0 +1,29 @@
+# .pre-commit-config.yaml
+# opencode-hashline — hash-anchored editing plugin for OpenCode.
+# Pre-commit hooks: hygiene + TypeScript type check (via existing `bun run typecheck`).
+
+repos:
+  # Universal hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-json
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+
+  # TypeScript: type check via existing `bun run typecheck` (= `tsc --noEmit`)
+  # Runs only when staged files include any .ts; pass_filenames: false because
+  # tsc checks the whole project per tsconfig.json, not individual files.
+  - repo: local
+    hooks:
+      - id: tsc-noemit
+        name: TypeScript type check (tsc --noEmit)
+        language: system
+        entry: bun run typecheck
+        types: [ts]
+        pass_filenames: false
