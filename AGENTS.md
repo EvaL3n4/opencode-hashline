@@ -19,7 +19,7 @@ All hooks confirmed against `@opencode-ai/plugin` type definitions and DCP plugi
 | Hook | Signature | Purpose |
 |---|---|---|
 | `tool.execute.before` | `(input: {tool, sessionID, callID}, output: {args}) => Promise<void>` | Stash `callID → {filePath, content}` for read/write. The `after` hook lacks args, so we capture them here. |
-| `tool.execute.after` | `(input: {tool, sessionID, callID, args}, output: {title, output, metadata}) => Promise<void>` | On read: prepend `[path#tag]` header to output, record snapshot. On write: record snapshot of written content. NOT for edit filediff—edit tools use `context.metadata()` + structured return instead. |
+| `tool.execute.after` | `(input: {tool, sessionID, callID, args}, output: {title, output, metadata}) => Promise<void>` | On read: prepend `[path#tag]` header to output, record snapshot + seenLines. On write: unwrap `[path#TAG]` from filePath, strip `N:` prefixes from content, record snapshot, echo `[path#hash]` header. NOT for edit filediff—edit tools use `context.metadata()` + structured return instead. |
 | `tool: { edit: tool(...) }` | Custom tool with `{ input: string }` arg | Replaces built-in edit entirely. Plugin tools with same name take precedence. |
 | `experimental.chat.system.transform` | `(input: {model, sessionID}, output: {system: string[]}) => Promise<void>` | Inject hashline syntax prompt into system message. Append to `output.system[output.system.length - 1]`. |
 
@@ -33,20 +33,22 @@ All hooks confirmed against `@opencode-ai/plugin` type definitions and DCP plugi
 - **Line numbers NOT part of hash input**, file path NOT part of hash input
 - **No collision handling** — 16-bit space is sufficient for session-local editing
 - **Store**: In-memory `Map<realpath, Snapshot[]>`, LRU (30 paths × 4 versions, 64 MiB cap)
-- **Path canonicalization**: `fs.realpathSync.native()`
+- **Path canonicalization**: `fs.realpathSync.native()` with parent-dir fallback for non-existing files (realpath parent + join basename)
 
 ### Snapshot Interface
 
 ```typescript
 interface Snapshot {
-  path: string;        // canonical realpath
-  text: string;        // full normalized file text
-  hash: string;        // 4-hex content tag
-  recordedAt: number;  // ms since epoch
+  path: string;              // canonical realpath
+  text: string;              // full normalized file text
+  hash: string;              // 4-hex content tag
+  recordedAt: number;        // ms since epoch
+  seenLines?: Set<number>;   // line numbers the model was shown (for seen-line enforcement)
 }
 
 class SnapshotStore {
-  record(path: string, text: string): string;     // returns hash
+  record(path: string, text: string, seenLines?: Iterable<number>): string;  // returns hash
+  recordSeenLines(path: string, hash: string, lines: Iterable<number>): void;
   byHash(path: string, hash: string): Snapshot | null;
   head(path: string): Snapshot | null;
   invalidate(path: string): void;
@@ -82,19 +84,22 @@ INS.TAIL:      — insert body rows at very end of file
 Body rows: `+literal content` (`+` alone = blank line)
 Range separator `.=` accepts variants: `-`, `..`, `…`, `=`, whitespace
 
-### Validation Pipeline (v1—simplified)
+### Validation Pipeline
 
-1. Parse patch → sections with `[PATH#TAG]` headers
-2. For each section: read file, normalize, compute hash
-3. **Hash matches** → apply edits to line array, record new snapshot
-4. **Hash mismatch** → try recovery before rejecting:
+1. Parse patch → sections with `[PATH#TAG]` headers (with header recovery for apply_patch noise, contamination detection for `@@`/`-`/sentinels, `*** Abort` handling)
+2. **Multi-section duplicate path detection** — reject if two sections resolve to the same canonical path
+3. For each section: read file, normalize, compute hash
+4. **Hash matches** → validate seen lines (reject edits to lines never displayed), validate line bounds, apply edits to line array, record new snapshot
+5. **Hash mismatch** → try recovery before rejecting:
    - **Head/tail drift tolerance**: INS.HEAD/INS.TAIL apply despite stale tag (position-stable), with HEADTAIL_DRIFT_WARNING
    - **3-way merge** (head snapshot, external write): Apply edits to snapshot text → `structuredPatch` (context=3) → `applyPatch` to current text (fuzzFactor=0). Conservative—fails if context lines changed.
    - **Session-chain replay** (non-head, prior in-session edit): Fast-path when 3-way merge refuses. Guards: equal line counts AND `verifyAnchorContent` (every anchor line identical in previous and current). Emits RECOVERY_SESSION_REPLAY_WARNING.
    - **Recovery fails** → hard reject with actionable error ("re-read the file to refresh tag")
-5. **All-or-nothing commit**: preflight all sections in memory before writing any
+6. **Trailing phantom line handling** — drop/clamp deletes targeting the empty trailing line from `split("\n")`
+7. **Noop detection** — if patch produces no changes, emit soft diagnostic; after 3 byte-identical noops, escalate to hard STOP
+8. **All-or-nothing commit**: preflight all sections in memory before writing any
 
-**Deferred to v2**: `seenLines` tracking, block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST), noop-loop guard, write tool hashline integration, search tool hashline mode, streaming diff preview, tokenizer refactor, header recovery, parser contamination detection. See beads for full v2 scope.
+**Deferred to v2**: block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST), search tool hashline mode, streaming diff preview, tokenizer refactor, DCP compaction survival. See beads for full v2 scope.
 
 ### Edit Tool Return Format
 
@@ -104,7 +109,7 @@ Edited [src/foo.py#NEW_TAG]
 6:new line
 ```
 
-Gives the model the fresh tag + changed lines so it can chain edits without re-reading.
+Gives the model the fresh tag + changed lines so it can chain edits without re-reading. Compact diff preview uses post-edit line numbers (via `buildCompactDiffPreview`) so the model can anchor follow-up edits directly.
 
 ### DCP Interaction
 
@@ -119,12 +124,23 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 - [x] Hash computation + normalization (`node:crypto` MD5 → 4-hex, 16-bit)
 - [x] Snapshot store (Map + LRU, 30 paths × 4 versions, 64 MiB cap)
 - [x] Read post-processing (header injection via `tool.execute.after`)
-- [x] Write post-processing (snapshot recording via `tool.execute.after`)
+- [x] Write post-processing (snapshot recording + path unwrapping + prefix stripping via `tool.execute.after`)
 - [x] Patch parser (state machine → Edit[])
 - [x] Edit application (apply SWAP/DEL/INS to line array)
 - [x] Edit tool replacement (`tool: { edit: tool(...) }`)
 - [x] System prompt injection (`experimental.chat.system.transform`)
 - [x] TUI diff preview (`metadata.diff` unified diff string via `createTwoFilesPatch`)
+- [x] Write tool hashline integration (unwrap `[path#TAG]`, strip `N:` prefixes, echo tag header)
+- [x] Parser contamination detection (reject `@@` hunks, `-` rows, apply_patch sentinels)
+- [x] Line bounds validation (reject out-of-bounds anchor lines)
+- [x] Header recovery (strip apply_patch noise from `[path#TAG]` headers)
+- [x] MismatchError class (structured `rejectionHeader` + `hashRecognized` path)
+- [x] canonicalPath for non-existing files (realpath parent + join basename)
+- [x] Trailing phantom line handling (drop/clamp deletes targeting empty trailing line)
+- [x] Multi-section duplicate path detection
+- [x] Compact diff preview (post-edit line numbers for chaining)
+- [x] Seen lines tracking (reject edits to lines never displayed)
+- [x] Noop detection + loop guard (3-strike escalation)
 
 ### Implementation Order
 
@@ -144,30 +160,28 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 - ~~Session-chain replay (apply to current with anchor-content guards)~~ ✅ Done
 - ~~Head/tail drift tolerance (INS.HEAD/INS.TAIL despite stale tag)~~ ✅ Done
 - ~~Boundary repair (auto-fix model's off-by-one mistakes)~~ ✅ Done
-
-**In progress (beads):**
-- `seenLines` tracking (reject edits to lines never displayed) — `q67`
-- Noop detection + loop guard — `ys1`
+- ~~Seen lines tracking (reject edits to lines never displayed)~~ ✅ Done — `q67`
+- ~~Noop detection + loop guard (3-strike escalation)~~ ✅ Done — `ys1`
+- ~~Write tool hashline integration (strip prefixes, echo tag, unwrap path)~~ ✅ Done — `wyv`
+- ~~Header recovery (strip apply_patch noise from headers)~~ ✅ Done — `8se`
+- ~~Parser contamination detection (reject `@@`/`-`/sentinels)~~ ✅ Done — `2rh`
+- ~~Line bounds validation~~ ✅ Done — `7kz`
+- ~~Trailing phantom line handling~~ ✅ Done — `xso`
+- ~~canonicalPath for non-existing files~~ ✅ Done — `jy7`
+- ~~Compact diff preview (post-edit line numbers)~~ ✅ Done — `ci5`
+- ~~Multi-section duplicate path detection~~ ✅ Done — `tpk`
+- ~~MismatchError class~~ ✅ Done — `dkj`
 
 **Ready (beads):**
 - Block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST) — requires tree-sitter — `3tu`
 - DCP compaction survival (`experimental.session.compacting` hook) — `65v`
-- Compact diff preview (post-edit line numbers for chaining) — `ci5`
-- Multi-section duplicate path detection — `tpk`
-- Write tool hashline integration (strip prefixes, echo tag, unwrap path) — `wyv`
-- Header recovery (strip apply_patch noise from headers) — `8se`
-- Parser contamination detection (reject `@@`/`-`/sentinels) — `2rh`
-- Line bounds validation — `7kz`
-- Trailing phantom line handling — `xso`
-- canonicalPath for non-existing files — `jy7`
 - Boundary repair 2-pass — `2k9`
 - Tokenizer (char-level state machine) — `8dy`
-- MismatchError class — `dkj`
+- Search/grep tool hashline mode — `7id` (unblocked, was blocked on `q67`)
 
 **Blocked (beads):**
-- System prompt expansion (depends on `q67` + `3tu`) — `dua`
+- System prompt expansion (depends on `3tu` only) — `dua`
 - Streaming diff preview (depends on `8dy`) — `25c`
-- Search/grep tool hashline mode (depends on `q67`) — `7id`
 
 **Final:**
 - npm publish — `10r` (gated on all above)
@@ -196,12 +210,17 @@ Runtime dependency: `diff` (for `metadata.diff` string). Hash uses `node:crypto`
 
 ### Testing Approach
 
+Automated test suite: `bun test ./test.ts` (419 assertions across 54 test sections covering all public functions). Typecheck: `./node_modules/.bin/tsc --noEmit`.
+
 Manual testing in OpenCode sessions:
 1. Read a file → verify `[path#tag]` header appears
 2. Edit via hashline syntax → verify changes apply, fresh tag returned
 3. Edit → verify TUI renders diff preview (unified diff view, not one-line fallback)
 4. Modify file externally → try to edit with old tag → verify rejection
 5. Chain edits → edit → edit → edit without re-reading → verify fresh tags work
+6. Write hashline-formatted content (`[path#TAG]\n1:foo`) → verify prefixes stripped, file gets clean content
+7. Edit with stale tag on INS.HEAD/INS.TAIL → verify drift tolerance + warning
+8. Repeat identical edit 3+ times → verify noop loop guard escalation
 
 ## Reference: oh-my-pi Source
 

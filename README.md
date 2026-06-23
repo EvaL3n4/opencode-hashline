@@ -44,9 +44,9 @@ ln -sf ~/opencode-hashline/src/index.ts ~/.config/opencode/plugins/hashline-edit
 
 ## How It Works
 
-1. **Read** — `tool.execute.after` hook prepends `[path#tag]` header, records snapshot
-2. **Edit** — Custom `edit` tool validates tag against current file hash, applies patch
-3. **Write** — `tool.execute.after` hook records snapshot of written content
+1. **Read** — `tool.execute.after` hook prepends `[path#tag]` header, records snapshot + seen lines
+2. **Edit** — Custom `edit` tool validates tag against current file hash, checks seen lines, validates line bounds, applies patch, returns fresh tag + compact diff preview
+3. **Write** — `tool.execute.after` hook unwraps `[path#TAG]` from path, strips `N:` prefixes from content, records snapshot, echoes `[path#hash]` header
 4. **System prompt** — `experimental.chat.system.transform` injects hashline syntax
 
 ### Edit Operations (v1)
@@ -60,6 +60,22 @@ INS.POST N:    Insert after line N
 INS.HEAD:      Insert at start of file
 INS.TAIL:      Insert at end of file
 ```
+
+### Validation & Safety Features
+
+- **Seen lines enforcement** — edits anchored on lines the model never saw are rejected
+- **Line bounds validation** — out-of-bounds anchor lines rejected before apply
+- **Trailing phantom line handling** — deletes targeting the empty trailing line from `split("\n")` are dropped/clamped
+- **Multi-section duplicate path detection** — two sections resolving to the same file are rejected
+- **Noop loop guard** — after 3 byte-identical no-op edits, escalates from soft hint to hard STOP
+- **Parser contamination detection** — rejects `@@` hunks, `-` rows, and apply_patch sentinels
+- **Header recovery** — strips apply_patch noise from `[path#TAG]` headers (e.g. `[***Update File:foo.ts#CB5A]`)
+- **Hash mismatch recovery** — 3-way merge, session-chain replay, head/tail drift tolerance
+- **Compact diff preview** — post-edit line numbers so the model can chain edits without re-reading
+
+## Testing
+
+Automated test suite: `bun test ./test.ts` (419 assertions across 54 test sections). Typecheck: `./node_modules/.bin/tsc --noEmit`.
 
 ## Origin
 
