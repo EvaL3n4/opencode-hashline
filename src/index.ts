@@ -1781,11 +1781,11 @@ const HASHLINE_PROMPT = `
 <hashline>
 Your edit tool uses hash-anchored patches. When you \`read\` a file, the output starts with \`[PATH#TAG]\` where TAG is a 4-hex content hash. Each line is prefixed with its line number: \`N:content\`.
 
-To edit, call the \`edit\` tool with a patch. Every file section starts with \`[PATH#TAG]\` — the tag from your latest \`read\`. The tag is REQUIRED on every section.
+To edit, call the \`edit\` tool with a patch. Every file section starts with \`[PATH#TAG]\` — the tag from your latest \`read\`/\`search\`. The tag is REQUIRED on every section — no hashless form. Create new files with \`write\`; hashline only edits existing files.
 
 <ops>
-\`SWAP N.=M:\` — replace lines N through M (inclusive) with body rows below. Single line: \`SWAP N.=N:\`.
-\`DEL N\` — delete line N. Range: \`DEL N.=M\` — delete lines N through M.
+\`SWAP N.=M:\` — replace original lines N through M (inclusive) with the body rows below. Single line: \`SWAP N.=N:\`. The range is the ORIGINAL lines you touch; body length is irrelevant (replacing 1 line with 10 is still \`SWAP N.=N:\`).
+\`DEL N\` — delete line N. Range: \`DEL N.=M\` — delete lines N through M. No body.
 \`INS.PRE N:\` — insert body rows immediately before line N.
 \`INS.POST N:\` — insert body rows immediately after line N.
 \`INS.HEAD:\` — insert body rows at the very start of the file.
@@ -1796,17 +1796,22 @@ To edit, call the \`edit\` tool with a patch. Every file section starts with \`[
 </ops>
 
 <body-rows>
-Body rows appear only under a \`:\` header. Every body row is \`+TEXT\` — add a literal line TEXT, verbatim (leading whitespace kept). \`+\` alone adds a blank line. NEVER write \`-old\` or bare/context lines. To keep a line, leave it out of every range.
+Body rows appear only under a \`:\` header. Every body row is \`+TEXT\` — add a literal line TEXT, verbatim (leading whitespace kept). \`+\` alone adds a blank line. No other row kind. NEVER write \`-old\` or a bare/context line. To keep a line, leave it out of every range. To insert a literal line starting with \`-\` or \`+\`, prefix it: \`+-x\`, \`++x\`.
 </body-rows>
 
 <rules>
-- Line numbers + \`[PATH#TAG]\` header come from your latest \`read\` (\`LINE:TEXT\` rows).
+- Line numbers + \`[PATH#TAG]\` header come from your latest \`read\`/\`search\` (\`LINE:TEXT\` rows).
 - Numbers refer to the ORIGINAL file; never shift as hunks apply.
-- Every applied edit mints a fresh \`#TAG\` — anchor the next edit on the edit response or a fresh \`read\`.
-- Ranges cover ONLY lines whose content changes. Never widen over unchanged lines.
+- Every applied edit mints a fresh \`#TAG\` and renumbers — anchor the next edit on the edit response or a fresh \`read\`.
+- Touch only lines your latest \`read\`/\`search\` literally displayed as \`LINE:TEXT\`; the tag certifies the snapshot, not your memory. A hunk anchored on a line you never displayed is REJECTED — re-\`read\` first. Seeing a line ≠ it holds the code you mean; confirm numbers map to the construct you intend, especially far from your read window.
+- Elided regions are UNSEEN: \`…\`/\`..\` markers and a collapsed \`N-M:\` summary row (only boundary lines N and M shown) hide their interior. NEVER place or span a hunk inside one — \`read\` the range first.
+- Never start or end a range mid-expression or mid-block.
+- Ranges cover ONLY lines whose content changes. Never widen over unchanged lines — a stale wide range shreds everything it spans.
 - Indent body rows exactly for the depth they should live at.
-- On a stale-tag rejection: STOP and re-\`read\` before further edits.
+- On a stale-tag rejection or any surprising result: STOP and re-\`read\` before further edits.
 - One hunk per range; body = final content, never an old/new pair.
+- Non-adjacent changes = separate hunks; untouched lines stay out of every range.
+- Pure additions use \`INS.PRE\`/\`INS.POST\`/\`INS.HEAD\`/\`INS.TAIL\`, never a widened \`SWAP\` — retyped keepers are exactly what gets dropped. (A multi-line \`SWAP\` whose body restates the line just past the range is auto-dropped as an off-by-one keeper with a warning — issue the payload for the range only; never lean on the repair.)
 - NEVER format/restyle code with this tool; run the project formatter instead.
 - Whole construct → \`SWAP.BLK N\` (tree-sitter resolves the end); lines inside it → \`SWAP N.=M\`.
 - \`SWAP.BLK N\` resolves EXACTLY the node at N. Leading decorators/attributes/doc-comments are separate nodes: point N at the FIRST decorator to sweep both; standalone line-comments are never swept—use \`SWAP N.=M\`.
@@ -1844,6 +1849,15 @@ Delete line 3:
 DEL 3
 \`\`\`
 
+Add a header and trailer:
+\`\`\`
+[greet.py#A1B2]
+INS.HEAD:
++# generated header
+INS.TAIL:
++greet("everyone")
+\`\`\`
+
 Replace the whole \`greet\` function block—\`SWAP.BLK 1:\` resolves lines 1–3 (the \`def\` header through \`print(msg)\`); line 4 is a separate statement and stays:
 \`\`\`
 [greet.py#A1B2]
@@ -1863,6 +1877,32 @@ SWAP.BLK 1:
 </example>
 
 <anti-patterns>
+# WRONG—empty \`SWAP\` to delete. RIGHT: \`DEL 4\`
+SWAP 4.=4:
+
+# WRONG—range describes post-edit size. RIGHT: \`SWAP 1.=1:\` (body length is irrelevant)
+SWAP 1.=2:
++def greet(name):
+
+# WRONG—\`-\` rows / bare context lines do not exist. The range deletes; the body is only the new content.
+SWAP 3.=3:
+    msg = "Hello, " + name
+-   print(msg)
++   return msg
+# RIGHT
+SWAP 3.=3:
++   return msg
+
+# WRONG—a pure insertion done as a widened \`SWAP\`: you want to add one line after 2,
+# but you replace 2.=4, retype the keepers, and drop one (here line 4, \`greet("world")\`).
+SWAP 2.=4:
++    msg = "Hello, " + name
++    extra = compute(name)
++    print(msg)
+# RIGHT—touch nothing you keep; the new line is the whole body.
+INS.POST 2:
++    extra = compute(name)
+
 # WRONG—\`INS.BLK.POST N:\` anchored on a closing delimiter / last visible line. RIGHT: plain \`INS.POST M:\`
 INS.BLK.POST 3:
 +after()
@@ -1870,6 +1910,13 @@ INS.BLK.POST 3:
 INS.POST 3:
 +after()
 </anti-patterns>
+
+<critical>
+If you remember nothing else:
+1. RE-GROUND AFTER EVERY EDIT. Every apply mints a fresh \`#TAG\` and renumbers — take the next edit's numbers from the edit response or a fresh \`read\`. Stale tag or surprise? STOP, re-\`read\`.
+2. RANGES ARE TIGHT. Cover only lines that change; a stale wide range shreds everything it spans. Whole construct → \`SWAP.BLK N\`.
+3. THE BODY IS THE FINAL CONTENT. Only \`+TEXT\` rows; never \`-old\`/context lines. The range does the deleting.
+</critical>
 </hashline>
 `.trim();
 

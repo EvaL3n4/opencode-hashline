@@ -49,16 +49,19 @@ ln -sf ~/opencode-hashline/src/index.ts ~/.config/opencode/plugins/hashline-edit
 3. **Write** — `tool.execute.after` hook unwraps `[path#TAG]` from path, strips `N:` prefixes from content, records snapshot, echoes `[path#hash]` header
 4. **System prompt** — `experimental.chat.system.transform` injects hashline syntax
 
-### Edit Operations (v1)
+### Edit Operations
 
 ```
-SWAP N.=M:     Replace lines N–M with body rows
-DEL N          Delete line N
-DEL N.=M       Delete lines N–M
-INS.PRE N:     Insert before line N
-INS.POST N:    Insert after line N
-INS.HEAD:      Insert at start of file
-INS.TAIL:      Insert at end of file
+SWAP N.=M:       Replace lines N–M with body rows
+DEL N            Delete line N
+DEL N.=M         Delete lines N–M
+INS.PRE N:       Insert before line N
+INS.POST N:      Insert after line N
+INS.HEAD:        Insert at start of file
+INS.TAIL:        Insert at end of file
+SWAP.BLK N:      Replace whole syntactic block (tree-sitter resolves end)
+DEL.BLK N        Delete whole syntactic block
+INS.BLK.POST N:  Insert after end of block
 ```
 
 ### Validation & Safety Features
@@ -71,11 +74,12 @@ INS.TAIL:      Insert at end of file
 - **Parser contamination detection** — rejects `@@` hunks, `-` rows, and apply_patch sentinels
 - **Header recovery** — strips apply_patch noise from `[path#TAG]` headers (e.g. `[***Update File:foo.ts#CB5A]`)
 - **Hash mismatch recovery** — 3-way merge, session-chain replay, head/tail drift tolerance
+- **Block operations** — `SWAP.BLK`/`DEL.BLK`/`INS.BLK.POST` resolve whole syntactic blocks via tree-sitter (17 languages supported)
 - **Compact diff preview** — post-edit line numbers so the model can chain edits without re-reading
 
 ## Testing
 
-Automated test suite: `bun test ./test.ts` (419 assertions across 54 test sections). Typecheck: `./node_modules/.bin/tsc --noEmit`.
+Automated test suite: `bun test ./test.ts` (524 assertions across 55 test sections). Typecheck: `./node_modules/.bin/tsc --noEmit`.
 
 ## Origin
 

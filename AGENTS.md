@@ -79,6 +79,9 @@ INS.PRE N:     — insert body rows immediately before line N
 INS.POST N:    — insert body rows immediately after line N
 INS.HEAD:      — insert body rows at very start of file
 INS.TAIL:      — insert body rows at very end of file
+SWAP.BLK N:    — replace whole syntactic block beginning on line N (tree-sitter resolves end)
+DEL.BLK N      — delete whole syntactic block beginning on line N
+INS.BLK.POST N: — insert body rows after end of block beginning on line N
 ```
 
 Body rows: `+literal content` (`+` alone = blank line)
@@ -99,7 +102,7 @@ Range separator `.=` accepts variants: `-`, `..`, `…`, `=`, whitespace
 7. **Noop detection** — if patch produces no changes, emit soft diagnostic; after 3 byte-identical noops, escalate to hard STOP
 8. **All-or-nothing commit**: preflight all sections in memory before writing any
 
-**Deferred to v2**: block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST), search tool hashline mode, streaming diff preview, tokenizer refactor, DCP compaction survival. See beads for full v2 scope.
+**Deferred to v2**: search tool hashline mode, streaming diff preview, tokenizer refactor, DCP compaction survival. See beads for full v2 scope.
 
 ### Edit Tool Return Format
 
@@ -141,6 +144,8 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 - [x] Compact diff preview (post-edit line numbers for chaining)
 - [x] Seen lines tracking (reject edits to lines never displayed)
 - [x] Noop detection + loop guard (3-strike escalation)
+- [x] Block operations (SWAP.BLK, DEL.BLK, INS.BLK.POST via tree-sitter WASM)
+- [x] System prompt expansion (140-line prompt with anti-patterns, seen-lines rules, critical summary)
 
 ### Implementation Order
 
@@ -171,16 +176,15 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 - ~~Compact diff preview (post-edit line numbers)~~ ✅ Done — `ci5`
 - ~~Multi-section duplicate path detection~~ ✅ Done — `tpk`
 - ~~MismatchError class~~ ✅ Done — `dkj`
+- ~~System prompt expansion~~ ✅ Done — `dua`
 
 **Ready (beads):**
-- Block ops (SWAP.BLK, DEL.BLK, INS.BLK.POST) — requires tree-sitter — `3tu`
 - DCP compaction survival (`experimental.session.compacting` hook) — `65v`
 - Boundary repair 2-pass — `2k9`
 - Tokenizer (char-level state machine) — `8dy`
 - Search/grep tool hashline mode — `7id` (unblocked, was blocked on `q67`)
 
 **Blocked (beads):**
-- System prompt expansion (depends on `3tu` only) — `dua`
 - Streaming diff preview (depends on `8dy`) — `25c`
 
 **Final:**
@@ -204,13 +208,15 @@ Managed in `~/.config/opencode/package.json` (OpenCode runs `bun install` at sta
 
 | `@opencode-ai/plugin` | TypeScript types for plugin development |
 | `diff` | Unified diff generation (`createTwoFilesPatch`) for TUI diff preview |
+| `web-tree-sitter` | WASM-based tree-sitter for block operations (SWAP.BLK, DEL.BLK, INS.BLK.POST) |
+| `@repomix/tree-sitter-wasms` | Pre-built WASM grammars (17 languages: TS/JS/Python/Rust/Go/C++/Java/etc) |
 | `@types/diff` | TypeScript types for `diff` package (devDependency) |
 
-Runtime dependency: `diff` (for `metadata.diff` string). Hash uses `node:crypto` (built-in).
+Runtime dependencies: `diff` (for `metadata.diff` string), `web-tree-sitter` + `@repomix/tree-sitter-wasms` (for block ops, lazy-loaded on first block op). Hash uses `node:crypto` (built-in).
 
 ### Testing Approach
 
-Automated test suite: `bun test ./test.ts` (419 assertions across 54 test sections covering all public functions). Typecheck: `./node_modules/.bin/tsc --noEmit`.
+Automated test suite: `bun test ./test.ts` (524 assertions across 55 test sections covering all public functions). Typecheck: `./node_modules/.bin/tsc --noEmit`.
 
 Manual testing in OpenCode sessions:
 1. Read a file → verify `[path#tag]` header appears
