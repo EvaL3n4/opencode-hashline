@@ -416,6 +416,30 @@ function getAnchorLine(edit: EditOp): number {
   }
 }
 
+function validateLineBounds(edits: readonly EditOp[], fileLines: readonly string[]): string | null {
+  const lineCount = fileLines.length;
+  for (const edit of edits) {
+    switch (edit.kind) {
+      case "swap":
+      case "delete":
+        if (edit.start < 1 || edit.start > lineCount) {
+          return `Line ${edit.start} does not exist (file has ${lineCount} lines).`;
+        }
+        if (edit.end < edit.start || edit.end > lineCount) {
+          return `Line ${edit.end} does not exist (file has ${lineCount} lines).`;
+        }
+        break;
+      case "insert":
+        if (edit.position === "head" || edit.position === "tail") break;
+        if (edit.anchor < 1 || edit.anchor > lineCount) {
+          return `Line ${edit.anchor} does not exist (file has ${lineCount} lines).`;
+        }
+        break;
+    }
+  }
+  return null;
+}
+
 function applySingleEdit(lines: string[], edit: EditOp): string[] {
   switch (edit.kind) {
     case "swap": {
@@ -1017,6 +1041,10 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
 
       if (!hasAnchorScopedEdit(section.edits)) {
         const fileLines = normalized.split("\n");
+        const boundsError = validateLineBounds(section.edits, fileLines);
+        if (boundsError) {
+          return { output: `Error: ${boundsError}` };
+        }
         const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(section.edits, fileLines);
         const newText = applyEdits(normalized, repairedEdits);
         prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: [HEADTAIL_DRIFT_WARNING, ...repairWarnings] });
@@ -1045,6 +1073,10 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
     }
 
     const fileLines = normalized.split("\n");
+    const boundsError = validateLineBounds(section.edits, fileLines);
+    if (boundsError) {
+      return { output: `Error: ${boundsError}` };
+    }
     const { edits: repairedEdits, warnings: repairWarnings } = repairEdits(section.edits, fileLines);
     const newText = applyEdits(normalized, repairedEdits);
     prepared.push({ path: section.path, newText, oldText: normalized, bom, lineEnding, warnings: repairWarnings });
