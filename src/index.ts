@@ -181,7 +181,12 @@ function canonicalPath(filePath: string): string {
   try {
     return realpathSync(filePath);
   } catch {
-    return filePath;
+    try {
+      const parent = realpathSync(path.dirname(filePath));
+      return path.join(parent, path.basename(filePath));
+    } catch {
+      return filePath;
+    }
   }
 }
 
@@ -193,6 +198,29 @@ function relativePath(from: string, to: string): string {
 const HL_PREFIX_RE = /^\s*(?:>>>|>>)?\s*(?:[+*-]\s*)?\d+:/;
 const HL_HEADER_RE = /^\s*\[[^#\r\n]+#[0-9a-fA-F]{4}\]\s*$/;
 const READ_TRUNCATION_NOTICE_RE = /^\[(?:Showing lines \d+-\d+ of \d+|\d+ more lines? in (?:file|\S+))\b.*\bUse :L?\d+/;
+const APPLY_PATCH_PATH_NOISE_RE = /^\*{0,3}\s*(?:(?:update|add|delete|move)[^A-Za-z0-9]*(?:file|to)?[^A-Za-z0-9]*:)?\s*\*{0,3}\s*/i;
+
+function stripApplyPatchPathNoise(pathText: string): string {
+  return pathText.replace(APPLY_PATCH_PATH_NOISE_RE, "");
+}
+
+function tryParseRecoveryHeader(line: string): { path: string; hash: string } | null {
+  if (!line.startsWith("[") || !line.endsWith("]")) return null;
+  const body = stripApplyPatchPathNoise(line.slice(1, line.length - 1).trim());
+  if (body.length === 0) return null;
+  const trailing = new RegExp("#([0-9A-Fa-f]{4})\\s*$").exec(body);
+  let pathText: string;
+  let fileHash: string | undefined;
+  if (trailing !== null) {
+    pathText = body.slice(0, trailing.index);
+    fileHash = trailing[1]!.toUpperCase();
+  } else {
+    pathText = body.replace(/\s+$/, "");
+  }
+  if (pathText.includes("#")) return null;
+  if (pathText.length === 0) return null;
+  return fileHash !== undefined ? { path: pathText, hash: fileHash } : null;
+}
 
 function stripLeadingHashlinePrefix(line: string): string {
   return line.replace(HL_PREFIX_RE, "");
@@ -291,11 +319,25 @@ function parsePatch(input: string): PatchSection[] {
       bodyTarget = null;
       if (currentSection) sections.push(currentSection);
       currentSection = {
-        path: headerMatch[1]!,
+        path: stripApplyPatchPathNoise(headerMatch[1]!),
         hash: headerMatch[2]!.toUpperCase(),
         edits: [],
       };
       continue;
+    }
+
+    if (line.startsWith("[") && line.endsWith("]")) {
+      const recovered = tryParseRecoveryHeader(line);
+      if (recovered) {
+        bodyTarget = null;
+        if (currentSection) sections.push(currentSection);
+        currentSection = {
+          path: recovered.path,
+          hash: recovered.hash,
+          edits: [],
+        };
+        continue;
+      }
     }
 
     if (!currentSection) continue;
@@ -992,20 +1034,52 @@ interface MismatchDetails {
   hashRecognized: boolean;
 }
 
+class MismatchError extends Error {
+  readonly path: string;
+  readonly expectedHash: string;
+  readonly actualHash: string;
+  readonly fileLines: string[];
+  readonly anchorLines: readonly number[];
+  readonly hashRecognized: boolean;
+
+  constructor(details: MismatchDetails) {
+    super(MismatchError.formatMessage(details));
+    this.name = "MismatchError";
+    this.path = details.path;
+    this.expectedHash = details.expectedHash;
+    this.actualHash = details.actualHash;
+    this.fileLines = details.fileLines;
+    this.anchorLines = details.anchorLines;
+    this.hashRecognized = details.hashRecognized;
+  }
+
+  get displayMessage(): string {
+    return MismatchError.formatMessage(this);
+  }
+
+  static rejectionHeader(details: MismatchDetails): string[] {
+    const pathText = ` for ${details.path}`;
+    return details.hashRecognized
+      ? [
+          `Edit rejected${pathText}: file changed between read and edit.`,
+          `Section is bound to #${details.expectedHash}, but the current file hashes to #${details.actualHash}. If a prior edit in this session modified this file, copy the [${details.path}#newhash] header from that edit's response; otherwise re-read the file with \`read\` to refresh the tag before retrying.`,
+        ]
+      : [
+          `Edit rejected${pathText}: hash #${details.expectedHash} is not from this session.`,
+          `The current file hashes to #${details.actualHash}. Re-read the file with \`read\` to copy a current [${details.path}#${details.actualHash}] header — never invent the tag and never reuse one from a prior session.`,
+        ];
+  }
+
+  static formatMessage(details: MismatchDetails): string {
+    const header = MismatchError.rejectionHeader(details);
+    const context = formatAnchoredContext(details.anchorLines, details.fileLines);
+    if (context.length === 0) return header.join("\n");
+    return [...header, "", ...context].join("\n");
+  }
+}
+
 function formatMismatchError(details: MismatchDetails): string {
-  const pathText = ` for ${details.path}`;
-  const header: string[] = details.hashRecognized
-    ? [
-        `Edit rejected${pathText}: file changed between read and edit.`,
-        `Section is bound to #${details.expectedHash}, but the current file hashes to #${details.actualHash}. If a prior edit in this session modified this file, copy the [${details.path}#newhash] header from that edit's response; otherwise re-read the file with \`read\` to refresh the tag before retrying.`,
-      ]
-    : [
-        `Edit rejected${pathText}: hash #${details.expectedHash} is not from this session.`,
-        `The current file hashes to #${details.actualHash}. Re-read the file with \`read\` to copy a current [${details.path}#${details.actualHash}] header — never invent the tag and never reuse one from a prior session.`,
-      ];
-  const context = formatAnchoredContext(details.anchorLines, details.fileLines);
-  if (context.length === 0) return header.join("\n");
-  return [...header, "", ...context].join("\n");
+  return new MismatchError(details).displayMessage;
 }
 
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
