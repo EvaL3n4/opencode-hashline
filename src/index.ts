@@ -2810,5 +2810,26 @@ export {
   parsePatchStreaming,
   type Token, type BlockTarget, type ParsedRange, type Anchor,
 };
-export default HashlinePlugin;
+// ─── Plugin Module Shape ────────────────────────────────────────────────────
+//
+// OpenCode's modern plugin loader (`readV1Plugin` in
+// `packages/opencode/src/plugin/shared.ts`) reads `mod.default` as a record and
+// requires file-based plugins to export an `id` string (see `resolvePluginId` —
+// throws `TypeError("Path plugin ${spec} must export id")` for file-source
+// plugins without one). The legacy fallback (`getLegacyPlugins` in
+// `packages/opencode/src/plugin/index.ts`) iterates `Object.values(mod)` and
+// throws "Plugin export is not a function" on the first non-function top-level
+// export. Because this module exports many named values for test access
+// (snapshotStore, NOOP_HARD_LIMIT, …), the legacy path always bailed before
+// reaching the plugin function — the plugin never actually loaded. Exporting a
+// PluginModule record as `default` keeps all named exports intact (the modern
+// path only reads `mod.default`) while satisfying both loaders.
+//
+// Shape: { id: string, server: PluginFunction }
+export default {
+  id: "hashline-edit",
+  server: HashlinePlugin,
+};
+
+// Named export so tests and consumers can reference the function directly.
 export { HashlinePlugin };
