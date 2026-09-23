@@ -2740,6 +2740,56 @@ SWAP.BLK 1:
   assert(!!freshTag && freshTag !== tag, "jqr: fresh tag minted");
 }
 
+// ── Test 61: Boundary repair pass 2 — whole-patch missing-closer resolution ─
+console.log("\n─ Boundary repair pass 2: missing closers ─");
+
+{
+  const wrapLines = [
+    "function wrap() {",
+    "  if (flag) {",
+    "    work();",
+    "  }",
+    "  tail();",
+    "}",
+  ];
+  const forgottenCloser: EditOp[] = [
+    { kind: "swap", start: 2, end: 4, lines: ["  if (flag) {", "    work();", "    extra();"] },
+  ];
+
+  // (A) payload forgot the if-block's closing brace; the whole patch is still
+  // missing it → the closer deleted by the range is kept. Pre-fix the swap
+  // applied raw and silently unbalanced the file.
+  const rA = repairEdits(forgottenCloser, wrapLines);
+  assertEq(rA.edits.length, 1, "2k9 A: one repaired edit");
+  const editA = rA.edits[0]!;
+  assert(editA.kind === "swap", "2k9 A: stays a swap");
+  if (editA.kind === "swap") {
+    assertEq(editA.start, 2, "2k9 A: range starts at 2");
+    assertEq(editA.end, 3, "2k9 A: range shrunk to 3 (deleted closer kept)");
+    assertEq(editA.lines.length, 3, "2k9 A: payload untouched");
+  }
+  assertEq(rA.warnings.length, 1, "2k9 A: one warning");
+  assert(rA.warnings[0]!.includes("kept 1 structural closing line"), "2k9 A: missing-closer warning");
+  const appliedA = applyEdits(wrapLines.join("\n"), rA.edits);
+  assert(appliedA.includes("    extra();\n  }\n  tail();"), "2k9 A: applied text keeps the if-closer");
+
+  // (B) another hunk deleted the matching opener above → residual is settled,
+  // deliberate wrapper removal — the closer stays deleted.
+  const rB = repairEdits([{ kind: "delete", start: 1, end: 1 }, ...forgottenCloser], wrapLines);
+  const swapB = rB.edits.find(e => e.kind === "swap")!;
+  assert(swapB.kind === "swap" && swapB.end === 4, "2k9 B: range NOT shrunk (opener removed by another hunk)");
+  assertEq(rB.warnings.length, 0, "2k9 B: no missing-closer warning");
+
+  // (C) no structural-closer suffix in the range → pass 2 abstains.
+  const noCloserRange: EditOp[] = [
+    { kind: "swap", start: 2, end: 2, lines: ["  if (flag) {"] },
+  ];
+  const rC = repairEdits(noCloserRange, wrapLines);
+  const swapC = rC.edits[0]!;
+  assert(swapC.kind === "swap" && swapC.end === 2, "2k9 C: non-closer range untouched");
+  assertEq(rC.warnings.length, 0, "2k9 C: no warnings");
+}
+
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 try { rmSync(tmpDir, { recursive: true }); } catch {}
