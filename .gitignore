@@ -12,6 +12,7 @@ dist/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads.*
 
 # graphify output
 graphify-out/
