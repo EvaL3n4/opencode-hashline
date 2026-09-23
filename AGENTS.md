@@ -12,18 +12,24 @@ Benchmarked in oh-my-pi: weakest models gain most (Grok Code Fast 1: 6.7%→68.3
 
 ## Architecture
 
-### Integration Points (OpenCode Plugin API)
+### Integration Points (OpenCode v2 Plugin API)
 
-All hooks confirmed against `@opencode-ai/plugin` type definitions and DCP plugin source.
+Plugin entry point is `export default { id, async setup(ctx) }` (loader wraps it into the Effect plugin shape; `setup` may return a disposer). The v1 `@opencode-ai/plugin` `Hooks` map is no longer how plugins load. Reference: `docs/opencode-v2-plugin-api.md`.
 
-| Hook | Signature | Purpose |
+| Registration | Shape | Purpose |
 |---|---|---|
-| `tool.execute.before` | `(input: {tool, sessionID, callID}, output: {args}) => Promise<void>` | Stash `callID → {filePath, content}` for read/write. The `after` hook lacks args, so we capture them here. |
-| `tool.execute.after` | `(input: {tool, sessionID, callID, args}, output: {title, output, metadata}) => Promise<void>` | On read: prepend `[path#tag]` header to output, record snapshot + seenLines. On write: unwrap `[path#TAG]` from filePath, strip `N:` prefixes from content, record snapshot, echo `[path#hash]` header. NOT for edit filediff—edit tools use `context.metadata()` + structured return instead. |
-| `tool: { edit: tool(...) }` | Custom tool with `{ input: string }` arg | Replaces built-in edit entirely. Plugin tools with same name take precedence. |
-| `experimental.chat.system.transform` | `(input: {model, sessionID}, output: {system: string[]}) => Promise<void>` | Inject hashline syntax prompt into system message. Append to `output.system[output.system.length - 1]`. |
+| `ctx.tool.hook("execute.before", cb)` | `event: {tool, sessionID, agent, messageID, id, input}` | Stash `id → {filePath, rawContent}` for read; unwrap `[path#TAG]` + strip prefixes for write. `input` is the LIVE args object—mutate in place (rebinding `event.input` is not read back). Only before-hooks may throw/reject. |
+| `ctx.tool.hook("execute.after", cb)` | success `{...,status:"completed", result:{content, output?, metadata?}}`; failure `{...,status:"error", error}` | Read: prepend `[path#tag]` header via `event.result.output`/`result.content`, record snapshot + seenLines. Write: record snapshot, echo `[path#hash]`. After-hooks must NOT throw (no failure channel). |
+| `ctx.tool.transform((editor) => editor.add({...}))` | editor: `{list, get, namespace, add, update, remove}` | Registers our `edit` tool. `add({name, description, input, options:{permission}, execute})`. `input` accepts plain JSON Schema (a valid `ValueSchema`). Transform callbacks are synchronous. |
+| `ctx.session.hook("context", cb)` | `event: SessionContext` | Inject hashline syntax prompt into `event.system` (a `SystemPart[]`—push `{type:"text", text}`, append to last part's `.text`). Also the live `event.tools` map. |
+| `ctx.session.hook("compaction", cb)` | `event: SessionCompaction extends SessionContext` | Push the active snapshot table so `[path#tag]` anchors survive DCP compaction. |
 
-**Critical API detail**: `tool.execute.after`'s input only has `{tool, sessionID, callID}`—no args. Must stash args in `tool.execute.before` keyed by `callID`.
+**Key details**:
+- `execute.after` receives `input` directly (unlike v1), but read content must still be captured in `before` (pre-read raw file text) — key the stash by `event.id` (callID), NOT `sessionID` (concurrent calls in one session collide).
+- Built-in tool args: `read` uses `input.path` (NOT `filePath`); `write` uses `input.filePath` + `input.content`.
+- Register `context` AND `compaction` separately—the `context` hook covers the agent loop only.
+- Plugin tools win on name collision with built-ins, BUT the built-in GPT `usePatch` filter deletes `tools.edit`/`tools.write` by name for `gpt-*` models (not `gpt-4`/`oss`) in `session.hook("context")`—applies to plugin tools too.
+- Tool execute ctx: `{sessionID, messageID, agent, id, directory, worktree}`. Worktree/directory are on the tool ctx directly; hooks without a tool ctx (grep after-hook, context/compaction) fall back to `ctx.location?.directory`.
 
 ### Hash & Snapshot System (adapted from oh-my-pi)
 
@@ -70,7 +76,7 @@ Read output gets a header prepended:
 
 Section header: `[PATH#TAG]` (TAG mandatory)
 
-Operations (v1—no block ops):
+Operations:
 ```
 SWAP N.=M:     — replace lines N through M (inclusive) with body rows
 DEL N          — delete line N
@@ -118,20 +124,20 @@ Gives the model the fresh tag + changed lines so it can chain edits without re-r
 
 Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress tool results containing `[path#tag]` headers. If those vanish, the model loses its anchors.
 
-**v1 mitigation**: The edit tool's error message handles this—if the model references a tag it never got (because DCP compressed the read result), the rejection message tells it to re-read.
-
-**v2 mitigation**: Use `experimental.session.compacting` to inject active snapshot table into compaction context.
+**Defense in depth** (both implemented):
+1. The edit tool's error message handles a missing tag—if the model references a tag it never got (because DCP compressed the read result), the rejection message tells it to re-read.
+2. `session.hook("compaction")` injects the active snapshot table into the compaction context, so `[path#tag]` anchors survive DCP compaction.
 
 ## Implementation Plan
 
 - [x] Hash computation + normalization (`node:crypto` MD5 → 4-hex, 16-bit)
 - [x] Snapshot store (Map + LRU, 30 paths × 4 versions, 64 MiB cap)
-- [x] Read post-processing (header injection via `tool.execute.after`)
-- [x] Write post-processing (snapshot recording + path unwrapping + prefix stripping via `tool.execute.after`)
+- [x] Read post-processing (header injection via `ctx.tool.hook("execute.after")`)
+- [x] Write post-processing (snapshot recording + path unwrapping + prefix stripping via `execute.before`/`after`)
 - [x] Patch parser (state machine → Edit[])
 - [x] Edit application (apply SWAP/DEL/INS to line array)
-- [x] Edit tool replacement (`tool: { edit: tool(...) }`)
-- [x] System prompt injection (`experimental.chat.system.transform`)
+- [x] Edit tool replacement (`ctx.tool.transform` → `editor.add({name:"edit"})`)
+- [x] System prompt injection (`session.hook("context")`)
 - [x] TUI diff preview (`metadata.diff` unified diff string via `createTwoFilesPatch`)
 - [x] Write tool hashline integration (unwrap `[path#TAG]`, strip `N:` prefixes, echo tag header)
 - [x] Parser contamination detection (reject `@@` hunks, `-` rows, apply_patch sentinels)
@@ -146,6 +152,7 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 - [x] Noop detection + loop guard (3-strike escalation)
 - [x] Block operations (SWAP.BLK, DEL.BLK, INS.BLK.POST via tree-sitter WASM)
 - [x] System prompt expansion (140-line prompt with anti-patterns, seen-lines rules, critical summary)
+- [x] OpenCode v2 plugin API migration (`setup(ctx)` + `tool.hook` / `tool.transform` / `session.hook`)
 
 ### Implementation Order
 
@@ -178,8 +185,9 @@ Snapshots live in plugin memory—DCP can't touch them. But DCP *can* compress t
 - ~~MismatchError class~~ ✅ Done — `dkj`
 - ~~System prompt expansion~~ ✅ Done — `dua`
 
+- ~~DCP compaction survival (`session.hook("compaction")`)~~ ✅ Done — `65v`
+
 **Ready (beads):**
-- DCP compaction survival (`experimental.session.compacting` hook) — `65v`
 - Boundary repair 2-pass — `2k9`
 - Tokenizer (char-level state machine) — `8dy`
 - Search/grep tool hashline mode — `7id` (unblocked, was blocked on `q67`)
@@ -206,11 +214,12 @@ OpenCode loads `.ts` files from the plugins directory at startup. Restart OpenCo
 
 Managed in `~/.config/opencode/package.json` (OpenCode runs `bun install` at startup):
 
-| `@opencode-ai/plugin` | TypeScript types for plugin development |
 | `diff` | Unified diff generation (`createTwoFilesPatch`) for TUI diff preview |
 | `web-tree-sitter` | WASM-based tree-sitter for block operations (SWAP.BLK, DEL.BLK, INS.BLK.POST) |
 | `@repomix/tree-sitter-wasms` | Pre-built WASM grammars (17 languages: TS/JS/Python/Rust/Go/C++/Java/etc) |
 | `@types/diff` | TypeScript types for `diff` package (devDependency) |
+
+No `@opencode-ai/plugin` import anymore—v2 plugins are plain `{ id, setup(ctx) }` modules with no SDK import. The package's `package.json` devDeps are `@opencode-ai/plugin@latest` + `typescript` only; the v2 types (`@opencode/plugin`) are not installed locally, so `docs/opencode-v2-plugin-api.md` is the API authority and the entry point uses `any` at the boundary.
 
 Runtime dependencies: `diff` (for `metadata.diff` string), `web-tree-sitter` + `@repomix/tree-sitter-wasms` (for block ops, lazy-loaded on first block op). Hash uses `node:crypto` (built-in).
 
@@ -281,69 +290,58 @@ Research clone at `~/research/oh-my-pi`. Key files studied:
 
 **Critical difference from oh-my-pi**: oh-my-pi has its own coding agent with its own hook system (`ExtensionRunner`/`HookRunner`). Hashline is a built-in library there, not an OpenCode plugin. We adapt the concepts to OpenCode's plugin API.
 
-## Reference: OpenCode Plugin API
+## Reference: OpenCode v2 Plugin API
+
+Authoritative reference: `docs/opencode-v2-plugin-api.md` (derived from `@opencode/plugin@2.0.10` source + a lab matrix against `@opencode/cli@2.0.10`). Sections below are a quick map; when they disagree with that doc, the doc wins.
 
 ### Plugin Structure
 
 ```typescript
-import type { Plugin } from "@opencode-ai/plugin";
-
-export const HashlinePlugin: Plugin = async ({ client, project, directory, worktree, $ }) => {
-  return {
-    "tool.execute.before": async (input, output) => { ... },
-    "tool.execute.after": async (input, output) => { ... },
-    "experimental.chat.system.transform": async (input, output) => { ... },
-    "chat.message": async (input, output) => { ... },
-    "event": async ({ event }) => { ... },
-    "config": async (config) => { ... },
-    tool: {
-      edit: tool({ description, args, execute })
-    }
-  };
+export default {
+  id: "opencode-hashline",
+  async setup(ctx) {
+    await ctx.tool.hook("execute.before", (event) => { /* mutate event.input in place */ });
+    await ctx.tool.hook("execute.after", (event) => { /* mutate event.result in place */ });
+    await ctx.session.hook("context", (event) => { /* event.system: SystemPart[] */ });
+    await ctx.session.hook("compaction", (event) => { /* SessionCompaction */ });
+    await ctx.tool.transform((editor) => { editor.add({ name, description, input, options, execute }); });
+    // setup may return a disposer function
+  },
 };
 ```
 
-### Key Patterns from DCP Source
+`ctx` domains: `app, location, options, rpc, agent, aisdk, command, event, experimental:{terminal:{read}}, generate, integration, mcp, model, permission, plugin, provider, reference, session, shell, skill, storage, tool, vcs, websearch, worktree`. **There is no `experimental.*` hook namespace**—v1's `experimental.chat.system.transform` is now `session.hook("context")`.
 
-DCP (`~/.cache/opencode/packages/@tarquinen/opencode-dcp@latest/`) uses:
-- `experimental.chat.system.transform` to inject system prompt (append to last element of `output.system`)
-- `experimental.chat.messages.transform` to modify message history
-- `config` hook to register commands and tools
-- `event` hook for `session.compacted`
-- Filters internal agents by signature strings (title generator, summarizer, etc.)
+### v1 → v2 hook map
 
-opencode-beads (`~/.cache/opencode/packages/opencode-beads@latest/`) uses:
-- `chat.message` to inject context (via `client.session.prompt` with `noReply: true, synthetic: true`)
-- `event` for `session.compacted` re-injection
-- `config` to register commands and agents
-- Checks agent mode (primary vs subagent) to skip subagent injection
+| v1 | v2 |
+|---|---|
+| `experimental.chat.system.transform` | `session.hook("context")` (edit `event.system`) |
+| `experimental.session.compacting` | `session.hook("compaction")` |
+| `tool: { edit: tool({...}) }` | `ctx.tool.transform((editor) => editor.add({...}))` |
+| `chat.message` | `session.hook("prompt")` |
+| `tool.execute.before` | `ctx.tool.hook("execute.before")` — `input` now on the event and LIVE |
+| `tool.execute.after` | `ctx.tool.hook("execute.after")` — output at `event.result.output`/`.content` |
 
-### Tool Definition API
+No v2 equivalent for: `experimental.text.complete`, `experimental.compaction.autocontinue`, `experimental.provider.small_model`, global `command.execute.before`.
+
+### Tool Registration
 
 ```typescript
-import { tool } from "@opencode-ai/plugin";
-
-const editTool = tool({
-  description: "Edit files using hashline patch syntax",
-  args: {
-    input: tool.schema.string().describe("Hashline patch content")
-  },
-  async execute(args, context) {
-    // context: ToolContext = {
-    //   sessionID, messageID, agent, directory, worktree, abort,
-    //   metadata(input: { title?, metadata? }): void,  // emit metadata DURING execute
-    //   ask(input): Effect  // permission prompt
-    // }
-    //
-    // ToolResult = string | { output: string, metadata?: {...} }
-    // Return a structured object to emit metadata for the TUI (diffs, diagnostics, etc.)
-    context.metadata({ metadata: { filediff: { ... } } });
-    return { output: "Edited [path#tag]\n5:new content", metadata: { filediff: { ... } }, title: "rel/path" };
-  }
+await ctx.tool.transform((editor) => {
+  editor.add({
+    name: "edit",
+    description: "...",
+    input: { type: "object", properties: { input: { type: "string" } }, required: ["input"], additionalProperties: false },
+    options: { permission: "edit" },   // routes through the edit/write permission gate
+    async execute(input, ctx) {        // ctx: { sessionID, messageID, agent, id, directory, worktree }
+      return { output, metadata, title };
+    },
+  });
 });
 ```
 
-If a plugin tool uses the same name as a built-in tool, the plugin tool takes precedence.
+`input` accepts Effect `Schema.Struct`, StandardSchemaV1, or plain JSON Schema—all valid `ValueSchema`. Transform editor callbacks are **synchronous**. Plugin tools win on name collision with built-ins.
 
 ### TUI Diff Preview Metadata (diff)
 
@@ -379,7 +377,15 @@ Where `filediff` is `{ file, before, after, patch, additions, deletions }` — i
 
 **Title**: worktree-relative path (e.g. `src/index.ts`), matching built-in tool's `path.relative(worktree, absPath)`.
 
-**Known v1 limitation**: `input.filePath` is missing because our tool args are `{ input: string }` (the patch), not `{ filePath, oldString, newString }`. The `input` field comes from the model's tool call arguments and cannot be modified by the plugin. Impact: TUI title shows `"← Edit undefined"` and no syntax highlighting. The diff itself renders correctly. Deferred to v2 (could add `filePath` as optional arg).
+**Known limitation**: `input.filePath` is missing because our tool args are `{ input: string }` (the patch), not `{ filePath, oldString, newString }`. The `input` field comes from the model's tool call arguments and cannot be modified by the plugin. Impact: TUI title shows `"← Edit undefined"` and no syntax highlighting. The diff itself renders correctly. (Could add `filePath` as an optional arg.)
+
+### v2 gotchas learned during migration
+
+- `execute.after` **must not throw** — there is no failure channel. Wrap bodies defensively.
+- Read output in the shipped v2.0.10 binary is plain `N: <content>` rows — no v1-style `<path>`/`<content>` XML wrapper. Verify empirically before relying on wrapper form.
+- `SystemPart = { type: "text", text, cache?, metadata? }`. Push objects, never bare strings; append to `event.system[last].text`, not `event.system[last] +=`.
+- `session.hook("context")` fires for the agent loop only; register `context` + `compaction` (+ `generate`/`title` if wanted) separately. Built-ins register the same callback on all three.
+- `event.tools` in the context hook is a LIVE map — delete/rename/rewrite entries by name (the GPT `usePatch` filter does `delete _.tools.edit; delete _.tools.write` for `gpt-*` excluding `oss`/`gpt-4`).
 
 ## Reference: The Harness Problem
 
@@ -526,7 +532,7 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 **Critical rules:**
 - Explicit user or orchestrator instructions override this Beads block.
-- Do not commit or push without clear authority from the active profile or the current user request.
+- Do not push without clear authority from the active profile or the current user request.
 - If a required sync or push is blocked, stop and report the exact command and error.
 
 <!-- END BEADS INTEGRATION -->
