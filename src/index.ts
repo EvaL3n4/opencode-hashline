@@ -2341,6 +2341,143 @@ const RECOVERY_SESSION_REPLAY_WARNING =
 const HEADTAIL_DRIFT_WARNING =
   "Applied the INS.HEAD:/INS.TAIL: edit despite a stale snapshot tag (file changed since your read) — head/tail position is content-independent. Re-read if the drift was unexpected.";
 
+// ─── Merge-conflict detection (ported from OMP conflict-detect.ts) ───────────
+
+interface ConflictBlock {
+  /** 1-indexed line of the `<<<<<<<` marker. */
+  startLine: number;
+  /** 1-indexed line of the `=======` separator. */
+  separatorLine: number;
+  /** 1-indexed line of the `>>>>>>>` marker. */
+  endLine: number;
+  /** 1-indexed line of the `|||||||` base marker (diff3 only). */
+  baseLine?: number;
+  oursLabel?: string;
+  baseLabel?: string;
+  theirsLabel?: string;
+  oursLines: string[];
+  baseLines?: string[];
+  theirsLines: string[];
+}
+
+const CONFLICT_OURS_PREFIX = "<<<<<<<";
+const CONFLICT_BASE_PREFIX = "|||||||";
+const CONFLICT_SEPARATOR = "=======";
+const CONFLICT_THEIRS_PREFIX = ">>>>>>>";
+
+function stripTrailingCr(line: string): string {
+  return line.endsWith("\r") ? line.slice(0, -1) : line;
+}
+
+/** Return the label after a marker prefix when the line is a valid
+ * column-0 marker, or `null` when it isn't. Strict shape: prefix alone,
+ * or prefix + single space + label. (Port of OMP `matchMarker`.) */
+function matchConflictMarker(line: string, prefix: string): string | null {
+  if (!line.startsWith(prefix)) return null;
+  if (line.length === prefix.length) return "";
+  if (line.charCodeAt(prefix.length) !== 32 /* space */) return null;
+  return line.slice(prefix.length + 1);
+}
+
+/** Scan lines for git merge-conflict blocks (port of OMP `scanConflictLines`).
+ * Unterminated blocks and marker-shaped noise (not column-0, no separator
+ * space) are ignored — same acceptance rules as git itself. */
+function scanConflictLines(lines: readonly string[], firstLineNumber: number): ConflictBlock[] {
+  const blocks: ConflictBlock[] = [];
+  let phase: "idle" | "ours" | "base" | "theirs" = "idle";
+  let partial: {
+    startLine: number;
+    oursLabel?: string;
+    oursLines: string[];
+    baseLine?: number;
+    baseLabel?: string;
+    baseLines?: string[];
+    separatorLine?: number;
+    theirsLines?: string[];
+  } | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripTrailingCr(lines[i]!);
+    const ln = firstLineNumber + i;
+
+    const oursLabel = matchConflictMarker(line, CONFLICT_OURS_PREFIX);
+    if (oursLabel !== null) {
+      partial = { startLine: ln, oursLabel: oursLabel || undefined, oursLines: [] };
+      phase = "ours";
+      continue;
+    }
+
+    if (phase === "idle" || partial === null) continue;
+
+    const baseLabel = matchConflictMarker(line, CONFLICT_BASE_PREFIX);
+    if (baseLabel !== null) {
+      if (phase !== "ours") {
+        partial = null;
+        phase = "idle";
+        continue;
+      }
+      partial.baseLine = ln;
+      partial.baseLabel = baseLabel || undefined;
+      partial.baseLines = [];
+      phase = "base";
+      continue;
+    }
+
+    if (line === CONFLICT_SEPARATOR) {
+      if (phase === "ours" || phase === "base") {
+        partial.separatorLine = ln;
+        partial.theirsLines = [];
+        phase = "theirs";
+      } else {
+        partial = null;
+        phase = "idle";
+      }
+      continue;
+    }
+
+    const theirsLabel = matchConflictMarker(line, CONFLICT_THEIRS_PREFIX);
+    if (theirsLabel !== null) {
+      if (phase === "theirs" && partial.separatorLine !== undefined && partial.theirsLines) {
+        blocks.push({
+          startLine: partial.startLine,
+          separatorLine: partial.separatorLine,
+          endLine: ln,
+          baseLine: partial.baseLine,
+          oursLabel: partial.oursLabel,
+          baseLabel: partial.baseLabel,
+          theirsLabel: theirsLabel || undefined,
+          oursLines: partial.oursLines,
+          baseLines: partial.baseLines,
+          theirsLines: partial.theirsLines,
+        });
+      }
+      partial = null;
+      phase = "idle";
+      continue;
+    }
+
+    if (phase === "ours") partial.oursLines.push(line);
+    else if (phase === "base" && partial.baseLines) partial.baseLines.push(line);
+    else if (phase === "theirs" && partial.theirsLines) partial.theirsLines.push(line);
+  }
+
+  return blocks;
+}
+
+/** One-line awareness warning when the text still contains unresolved
+ * conflict blocks; `null` when clean. */
+function formatConflictWarning(text: string): string | null {
+  const blocks = scanConflictLines(text.split("\n"), 1);
+  if (blocks.length === 0) return null;
+  const n = blocks.length;
+  const blockWord = n === 1 ? "block" : "blocks";
+  const where = blocks[0]!.startLine;
+  return (
+    `This file has ${n} unresolved git merge-conflict ${blockWord} (first at line ${where}). ` +
+    `Markers are ordinary lines: resolve by editing (delete the marker rows, keep one side) or with git, then continue.`
+  );
+}
+
 interface RecoveryResult {
   text: string;
   firstChangedLine?: number;
@@ -2757,7 +2894,10 @@ export async function executeHashlineEdit(args: { input: string }, context: Edit
     const numberedDiff = buildNumberedDiff(entry.oldText, entry.newText);
     const compactPreview = buildCompactDiffPreview(numberedDiff);
     const linePreview = compactPreview.preview;
-    const warningPrefix = entry.warnings.length > 0 ? entry.warnings.map(w => `⚠ ${w}`).join("\n") + "\n" : "";
+    const conflictWarning = formatConflictWarning(entry.newText);
+    const warningLines = [...entry.warnings.map(w => `⚠ ${w}`)];
+    if (conflictWarning) warningLines.push(`⚠ ${conflictWarning}`);
+    const warningPrefix = warningLines.length > 0 ? warningLines.join("\n") + "\n" : "";
     results.push(`${warningPrefix}Edited [${entry.path}#${newHash}]\n${linePreview}`);
   }
 
@@ -3019,7 +3159,8 @@ export default {
         if (seenLines.length > 0) {
           snapshotStore.recordSeenLines(canonical, hash, seenLines);
         }
-        prependToolOutput(event, `[${callInfo.filePath}#${hash}]`);
+        const conflictWarning = formatConflictWarning(rawContent);
+        prependToolOutput(event, `[${callInfo.filePath}#${hash}]${conflictWarning ? "\n" + conflictWarning : ""}`);
       }
 
       if (event.tool === "write" && callInfo?.filePath) {
@@ -3154,6 +3295,7 @@ export {
   noChangeDiagnostic, noChangeLoopDiagnostic, NOOP_HARD_LIMIT,
   HEADTAIL_DRIFT_WARNING, RECOVERY_EXTERNAL_WARNING,
   RECOVERY_SESSION_CHAIN_WARNING, RECOVERY_SESSION_REPLAY_WARNING,
+  type ConflictBlock, scanConflictLines, formatConflictWarning,
   MISMATCH_CONTEXT,
   unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,

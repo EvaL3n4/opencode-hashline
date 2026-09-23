@@ -16,6 +16,7 @@ import {
   hashPatchInput, recordNoopEdit, resetNoopEdit,
   noChangeDiagnostic, noChangeLoopDiagnostic, NOOP_HARD_LIMIT,
   RECOVERY_EXTERNAL_WARNING, RECOVERY_SESSION_REPLAY_WARNING,
+  scanConflictLines, formatConflictWarning,
   unwrapHashlineHeaderPath, stripWriteContent, stripHashlinePrefixes, stripLeadingHashlinePrefix,
   detectContamination, validateLineBounds, tryParseRecoveryHeader, stripApplyPatchPathNoise,
   trailingPhantomLine, dropTrailingPhantomDeletes, assertUniqueCanonicalPaths,
@@ -2788,6 +2789,147 @@ console.log("\n─ Boundary repair pass 2: missing closers ─");
   const swapC = rC.edits[0]!;
   assert(swapC.kind === "swap" && swapC.end === 2, "2k9 C: non-closer range untouched");
   assertEq(rC.warnings.length, 0, "2k9 C: no warnings");
+}
+
+// ── Test 62: Merge-conflict detection (a9y) ──────────────────────────────────
+console.log("\n─ Merge-conflict detection: scanner + warning ─");
+
+{
+  // (A) single block with labels
+  const conflictLines = [
+    "import a",
+    "<<<<<<< HEAD",
+    "const x = 1;",
+    "=======",
+    "const x = 2;",
+    ">>>>>>> feature",
+    "export default x;",
+  ];
+  const blocksA = scanConflictLines(conflictLines, 1);
+  assertEq(blocksA.length, 1, "a9y A: one block");
+  const bA = blocksA[0]!;
+  assertEq(bA.startLine, 2, "a9y A: start line");
+  assertEq(bA.separatorLine, 4, "a9y A: separator line");
+  assertEq(bA.endLine, 6, "a9y A: end line");
+  assertEq(bA.oursLabel, "HEAD", "a9y A: ours label");
+  assertEq(bA.theirsLabel, "feature", "a9y A: theirs label");
+  assertEq(bA.oursLines.join("|"), "const x = 1;", "a9y A: ours side content");
+  assertEq(bA.theirsLines.join("|"), "const x = 2;", "a9y A: theirs side content");
+  assertEq(bA.baseLine, undefined, "a9y A: no diff3 base");
+
+  // (B) diff3 base section (|||||||)
+  const blocksB = scanConflictLines([
+    "<<<<<<< ours",
+    "a",
+    "||||||| base",
+    "b",
+    "=======",
+    "c",
+    ">>>>>>> theirs",
+  ], 1);
+  assertEq(blocksB.length, 1, "a9y B: diff3 block parsed");
+  assertEq(blocksB[0]!.baseLine, 3, "a9y B: base marker line");
+  assertEq(blocksB[0]!.baseLines!.join("|"), "b", "a9y B: base side content");
+
+  // (C) multiple blocks + firstLineNumber offset
+  const blocksC = scanConflictLines([
+    "<<<<<<< a",
+    "=======",
+    ">>>>>>> b",
+    "clean",
+    "<<<<<<< c",
+    "=======",
+    ">>>>>>> d",
+  ], 10);
+  assertEq(blocksC.length, 2, "a9y C: two blocks");
+  assertEq(blocksC[1]!.startLine, 14, "a9y C: firstLineNumber offset honored");
+
+  // (D) marker-shaped noise is not a block (column-0 + exact prefix + space/EOL)
+  const blocksD = scanConflictLines([
+    'const s = "<<<<<<<"',
+    "  <<<<<<< indented",
+    "<<<<<<<HEAD",
+    "// >>>>>>> mid-line",
+    "========",
+    "=======",
+  ], 1);
+  assertEq(blocksD.length, 0, "a9y D: marker-like noise rejected");
+
+  // (E) orphan ||||||| resets; double base resets; unterminated block dropped
+  const blocksE = scanConflictLines([
+    "||||||| orphan base",
+    "<<<<<<< ours",
+    "||||||| base",
+    "x",
+    "||||||| second base",
+    "=======",
+    "y",
+  ], 1);
+  assertEq(blocksE.length, 0, "a9y E: resets + unterminated → no blocks");
+
+  // (F) trailing-newline edge: split("\n") trailing "" is harmless
+  const blocksF = scanConflictLines("<<<<<<< a\n=======\n>>>>>>> b\n".split("\n"), 1);
+  assertEq(blocksF.length, 1, "a9y F: trailing empty line harmless");
+
+  // (G) CRLF lines scan the same
+  const blocksG = scanConflictLines([
+    "<<<<<<< a\r",
+    "=======\r",
+    ">>>>>>> b\r",
+  ], 1);
+  assertEq(blocksG.length, 1, "a9y G: CRLF markers scan");
+
+  // (H) formatConflictWarning: count + first line; null when clean
+  const warnH = formatConflictWarning(conflictLines.join("\n"));
+  assert(warnH !== null && warnH.includes("1 unresolved git merge-conflict block (first at line 2)"), "a9y H: single-block warning names count + first line");
+  assertEq(formatConflictWarning("const x = 1;\nconst y = 2;\n"), null, "a9y H: clean file → null");
+}
+
+{
+  // (I) real edit path: partial resolution leaves markers → warning surfaces;
+  // full resolution → no warning. Markers are ordinary lines to the tag system.
+  const a9yFile = path.join(tmpDir, "a9y-conflict.ts");
+  const conflicted = [
+    "import a",
+    "<<<<<<< HEAD",
+    "const x = 1",
+    "=======",
+    "const x = 2",
+    ">>>>>>> feature",
+    "const y = 3",
+    "<<<<<<< HEAD",
+    "const z = 4",
+    "=======",
+    "const z = 5",
+    ">>>>>>> feature",
+    "export default [x, y, z]",
+  ].join("\n");
+  writeFileSync(a9yFile, conflicted);
+  const a9yCanonical = canonicalPath(a9yFile);
+  const a9yTag = snapshotStore.record(a9yCanonical, conflicted);
+
+  // Resolve the first block (keep ours) — second block still open.
+  const partial = `[${a9yFile}#${a9yTag}]
+SWAP 2.=6:
++const x = 1
+`;
+  const partialResult = await executeHashlineEdit({ input: partial }, { sessionID: "a9y-test-1", worktree: tmpDir, metadata() {} });
+  assert(partialResult.output.includes("Edited ["), "a9y I: partial edit applied");
+  assert(partialResult.output.includes("⚠ This file has 1 unresolved git merge-conflict block (first at line 4)"), "a9y I: remaining-block warning surfaced in edit output");
+  const afterPartial = readFileSync(a9yFile, "utf-8");
+  assert(afterPartial.includes("<<<<<<<"), "a9y I: second block still on disk");
+
+  // Re-read (fresh tag), then resolve the second block too → warning gone.
+  const liveText = readFileSync(a9yFile, "utf-8");
+  const liveTag = snapshotStore.record(a9yCanonical, liveText);
+  const full = `[${a9yFile}#${liveTag}]
+SWAP 4.=8:
++const z = 5
+`;
+  const fullResult = await executeHashlineEdit({ input: full }, { sessionID: "a9y-test-1", worktree: tmpDir, metadata() {} });
+  assert(fullResult.output.includes("Edited ["), "a9y I: full-resolution edit applied");
+  assert(!fullResult.output.includes("merge-conflict"), "a9y I: no warning once fully resolved");
+  assert(!readFileSync(a9yFile, "utf-8").includes("<<<<<<<"), "a9y I: no markers left on disk");
 }
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
