@@ -1,5 +1,3 @@
-import type { Plugin } from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin";
 import { readFileSync, realpathSync, writeFileSync, existsSync } from "fs";
 import { createHash } from "crypto";
 import * as path from "path";
@@ -49,7 +47,7 @@ interface CompactDiffPreview {
   removedLines: number;
 }
 
-type EditContext = {
+export type EditContext = {
   sessionID: string;
   worktree: string;
   metadata(input: { title?: string; metadata?: { [key: string]: any } }): void;
@@ -2312,7 +2310,7 @@ function assertUniqueCanonicalPaths(sections: PatchSection[]): string | null {
 
 // ─── Edit Tool ───────────────────────────────────────────────────────────────
 
-async function executeHashlineEdit(args: { input: string }, context: EditContext): Promise<ToolResult> {
+export async function executeHashlineEdit(args: { input: string }, context: EditContext): Promise<ToolResult> {
   let sections: PatchSection[];
   try {
     sections = parsePatch(args.input);
@@ -2357,30 +2355,26 @@ async function executeHashlineEdit(args: { input: string }, context: EditContext
       }
 
       if (snapshot) {
+        let recoveryEdits: readonly EditOp[] = section.edits;
+        let blockWarnings: string[] = [];
+        if (hasBlockEdit(section.edits)) {
+          try {
+            const resolvedBlocks = await resolveBlockEdits(section.edits, snapshot.text, section.path);
+            recoveryEdits = resolvedBlocks.edits;
+            blockWarnings = resolvedBlocks.warnings;
+          } catch (e) {
+            return { output: `Error: ${(e as Error).message}` };
+          }
+        }
         const recovered = tryRecover(snapshotStore, {
           path: canonical,
           currentText: normalized,
           fileHash: section.hash,
-          edits: section.edits,
+          edits: recoveryEdits,
         });
         if (recovered) {
-          let resolvedText = recovered.text;
-          let resolvedWarnings = recovered.warnings;
-          if (hasBlockEdit(section.edits)) {
-            try {
-              const { edits: resolvedEdits, warnings: blockWarnings } = await resolveBlockEdits(section.edits, resolvedText, section.path);
-              const rfileLines = resolvedText.split("\n");
-              const rboundsError = validateLineBounds(resolvedEdits, rfileLines);
-              if (rboundsError) return { output: `Error: ${rboundsError}` };
-              const { edits: rRepairedEdits, warnings: rRepairWarnings } = repairEdits(resolvedEdits, rfileLines);
-              const rPhantomSafeEdits = dropTrailingPhantomDeletes(rRepairedEdits, rfileLines);
-              resolvedText = applyEdits(resolvedText, rPhantomSafeEdits);
-              resolvedWarnings = [...resolvedWarnings, ...rRepairWarnings, ...blockWarnings];
-            } catch (e) {
-              return { output: `Error: ${(e as Error).message}` };
-            }
-          }
-          prepared.push({ path: section.path, newText: resolvedText, oldText: normalized, bom, lineEnding, warnings: resolvedWarnings });
+          const warnings = [...recovered.warnings, ...blockWarnings];
+          prepared.push({ path: section.path, newText: recovered.text, oldText: normalized, bom, lineEnding, warnings });
           continue;
         }
         const fileLines = normalized.split("\n");
@@ -2627,73 +2621,118 @@ const INTERNAL_AGENT_SIGNATURES = [
   "Summarize what was done in this conversation",
 ];
 
-function isInternalAgent(system: string[]): boolean {
-  const text = system.join("\n");
+type SystemPart = { type?: string; text?: string };
+
+function isInternalAgent(system: SystemPart[]): boolean {
+  const text = system.map((p) => p?.text ?? "").join("\n");
   return INTERNAL_AGENT_SIGNATURES.some((sig) => text.includes(sig));
 }
 
-// ─── Plugin Entry Point ──────────────────────────────────────────────────────
+// ─── V2 Tool Output Helpers ──────────────────────────────────────────────────
 
-const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
+function toolOutputText(event: any): string {
+  const result = event?.result;
+  if (!result) return "";
+  if (typeof result.output === "string") return result.output;
+  if (typeof result.content === "string") return result.content;
+  if (Array.isArray(result.content)) {
+    return result.content
+      .map((p: any) => (typeof p === "string" ? p : p?.text ?? ""))
+      .join("");
+  }
+  return "";
+}
+
+function prependToolOutput(event: any, header: string): void {
+  const result = event?.result;
+  if (!result) return;
+  const current = toolOutputText(event);
+  const merged = header + "\n" + current;
+  result.output = merged;
+  if (Array.isArray(result.content)) {
+    result.content = [{ type: "text", text: header + "\n" }, ...result.content];
+  } else {
+    result.content = [{ type: "text", text: merged }];
+  }
+}
+
+function replaceToolOutput(event: any, text: string): void {
+  const result = event?.result;
+  if (!result) return;
+  result.output = text;
+  result.content = [{ type: "text", text }];
+}
+
+function adaptToolCtx(toolCtx: any): EditContext {
   return {
-    "tool.execute.before": async (input, output) => {
-      if (input.tool === "read") {
-        const filePath = output.args?.filePath;
+    sessionID: toolCtx?.sessionID,
+    worktree: toolCtx?.worktree ?? toolCtx?.directory,
+    metadata: (input) => {
+      if (toolCtx && typeof toolCtx.metadata === "function") toolCtx.metadata(input);
+    },
+  };
+}
+
+// ─── Plugin Entry Point (V2) ─────────────────────────────────────────────────
+
+export default {
+  id: "opencode-hashline",
+  async setup(ctx: any) {
+    // ── Tool execute.before: stash read/write call info ──────────────────────
+    await ctx.tool.hook("execute.before", (event: any) => {
+      if (event.tool === "read") {
+        const filePath = event.input?.path;
         if (filePath) {
           const callInfo: CallInfo = { filePath };
           try {
             callInfo.rawContent = readFileSync(filePath, "utf-8");
           } catch {}
-          pendingCalls.set(input.callID, callInfo);
+          pendingCalls.set(event.id, callInfo);
         }
       }
 
-      if (input.tool === "write") {
-        const rawFilePath = output.args?.filePath;
+      if (event.tool === "write") {
+        const rawFilePath = event.input?.filePath;
         if (rawFilePath) {
           const filePath = unwrapHashlineHeaderPath(rawFilePath);
-          const writeContent = stripWriteContent(output.args?.content ?? "");
-          const callInfo: CallInfo = {
-            filePath,
-            writeContent,
-          };
-          pendingCalls.set(input.callID, callInfo);
-          output.args.filePath = filePath;
-          output.args.content = writeContent;
+          const writeContent = stripWriteContent(event.input?.content ?? "");
+          const callInfo: CallInfo = { filePath, writeContent };
+          pendingCalls.set(event.id, callInfo);
+          event.input.filePath = filePath;
+          event.input.content = writeContent;
         }
       }
-    },
+    });
 
-    "tool.execute.after": async (input, output) => {
-      const callInfo = pendingCalls.get(input.callID);
+    // ── Tool execute.after: inject headers, record snapshots ─────────────────
+    await ctx.tool.hook("execute.after", (event: any) => {
+      const callInfo = pendingCalls.get(event.id);
 
-      if (input.tool === "read" && callInfo?.filePath) {
-        pendingCalls.delete(input.callID);
+      if (event.tool === "read" && callInfo?.filePath) {
+        pendingCalls.delete(event.id);
         const canonical = canonicalPath(callInfo.filePath);
         const rawContent = callInfo.rawContent ?? "";
-        const hash = snapshotStore.record(canonical, rawContent, undefined, input.sessionID);
-        const seenLines = parseSeenLinesFromHashlineBody(output.output ?? "");
+        const hash = snapshotStore.record(canonical, rawContent, undefined, event.sessionID);
+        const body = toolOutputText(event);
+        const seenLines = parseSeenLinesFromHashlineBody(body);
         if (seenLines.length > 0) {
           snapshotStore.recordSeenLines(canonical, hash, seenLines);
         }
-        output.output = `[${callInfo.filePath}#${hash}]\n${output.output}`;
+        prependToolOutput(event, `[${callInfo.filePath}#${hash}]`);
       }
 
-      if (input.tool === "write" && callInfo?.filePath) {
-        pendingCalls.delete(input.callID);
+      if (event.tool === "write" && callInfo?.filePath) {
+        pendingCalls.delete(event.id);
         const canonical = canonicalPath(callInfo.filePath);
         const content = callInfo.writeContent ?? "";
-        const hash = snapshotStore.record(canonical, content, undefined, input.sessionID);
-        if (output.output) {
-          output.output = `[${callInfo.filePath}#${hash}]\n${output.output}`;
-        } else {
-          output.output = `[${callInfo.filePath}#${hash}]`;
-        }
+        const hash = snapshotStore.record(canonical, content, undefined, event.sessionID);
+        prependToolOutput(event, `[${callInfo.filePath}#${hash}]`);
       }
 
-      if (input.tool === "grep") {
-        const parsed = parseGrepOutput(output.output ?? "");
+      if (event.tool === "grep") {
+        const parsed = parseGrepOutput(toolOutputText(event));
         if (parsed && parsed.files.length > 0) {
+          const worktree = ctx.location?.directory;
           const sections: string[] = [];
           if (parsed.header) sections.push(parsed.header);
 
@@ -2704,7 +2743,7 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
               const content = readFileSync(file.path, "utf-8");
               if (content.length <= MAX_GREP_SNAPSHOT_BYTES) {
                 canonical = canonicalPath(file.path);
-                tag = snapshotStore.record(canonical, content, undefined, input.sessionID);
+                tag = snapshotStore.record(canonical, content, undefined, event.sessionID);
               }
             } catch {}
 
@@ -2726,16 +2765,18 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
           }
 
           if (parsed.footer) sections.push(parsed.footer);
-          output.output = sections.join("\n\n");
+          replaceToolOutput(event, sections.join("\n\n"));
         }
       }
-    },
+    });
 
-    "experimental.chat.system.transform": async (input, output) => {
-      if (isInternalAgent(output.system)) return;
+    // ── System prompt injection ───────────────────────────────────────────────
+    await ctx.session.hook("context", (event: any) => {
+      if (isInternalAgent(event.system)) return;
 
+      const worktree = ctx.location?.directory;
       let prompt = HASHLINE_PROMPT;
-      const entries = snapshotStore.entriesForSession(input.sessionID);
+      const entries = snapshotStore.entriesForSession(event.sessionID);
       if (entries.length > 0) {
         const table = buildSnapshotTable(entries, worktree);
         if (table) {
@@ -2743,36 +2784,52 @@ const HashlinePlugin: Plugin = async ({ client, $, directory, worktree }) => {
         }
       }
 
-      if (output.system.length > 0) {
-        output.system[output.system.length - 1] += "\n\n" + prompt;
+      if (event.system.length > 0) {
+        const last = event.system[event.system.length - 1];
+        last.text = (last.text ?? "") + "\n\n" + prompt;
       } else {
-        output.system.push(prompt);
+        event.system.push({ type: "text", text: prompt });
       }
-    },
+    });
 
-    "experimental.session.compacting": async (input, output) => {
-      const entries = snapshotStore.entriesForSession(input.sessionID);
+    // ── Compaction survival: preserve snapshot table ─────────────────────────
+    await ctx.session.hook("compaction", (event: any) => {
+      const worktree = ctx.location?.directory;
+      const entries = snapshotStore.entriesForSession(event.sessionID);
       if (entries.length === 0) return;
       const table = buildSnapshotTable(entries, worktree);
       if (!table) return;
-      output.context.push(
-        "Active file snapshots — these [path#tag] anchors remain valid after compaction. " +
-        "The model uses them in edit operations. Preserve the tags and file paths in your summary.\n\n" + table,
-      );
-    },
+      if (event.system) {
+        event.system.push({
+          type: "text",
+          text:
+            "Active file snapshots — these [path#tag] anchors remain valid after compaction. " +
+            "The model uses them in edit operations. Preserve the tags and file paths in your summary.\n\n" +
+            table,
+        });
+      }
+    });
 
-    tool: {
-      edit: tool({
+    // ── Edit tool registration ───────────────────────────────────────────────
+    await ctx.tool.transform((editor: any) => {
+      editor.add({
+        name: "edit",
         description: "Edit files using hash-anchored patches. Read a file first to get its [PATH#TAG] header, then call this tool with a patch. Each section starts with [PATH#TAG] (tag from your latest read). Operations: SWAP N.=M: (replace lines), DEL N (delete line), INS.PRE N: / INS.POST N: / INS.HEAD: / INS.TAIL: (insert). Body rows are +TEXT lines.",
-        args: {
-          input: tool.schema.string().describe("Hashline patch content. Each section: [PATH#TAG] header, then operations with +body rows."),
+        input: {
+          type: "object",
+          properties: {
+            input: { type: "string", description: "Hashline patch content. Each section: [PATH#TAG] header, then operations with +body rows." },
+          },
+          required: ["input"],
+          additionalProperties: false,
         },
-        async execute(args, context) {
-          return executeHashlineEdit(args, context);
+        options: { permission: "edit" },
+        async execute(input: any, toolCtx: any) {
+          return executeHashlineEdit(input, adaptToolCtx(toolCtx));
         },
-      }),
-    },
-  };
+      });
+    });
+  },
 };
 
 // ─── Test Exports ───────────────────────────────────────────────────────────
@@ -2810,26 +2867,3 @@ export {
   parsePatchStreaming,
   type Token, type BlockTarget, type ParsedRange, type Anchor,
 };
-// ─── Plugin Module Shape ────────────────────────────────────────────────────
-//
-// OpenCode's modern plugin loader (`readV1Plugin` in
-// `packages/opencode/src/plugin/shared.ts`) reads `mod.default` as a record and
-// requires file-based plugins to export an `id` string (see `resolvePluginId` —
-// throws `TypeError("Path plugin ${spec} must export id")` for file-source
-// plugins without one). The legacy fallback (`getLegacyPlugins` in
-// `packages/opencode/src/plugin/index.ts`) iterates `Object.values(mod)` and
-// throws "Plugin export is not a function" on the first non-function top-level
-// export. Because this module exports many named values for test access
-// (snapshotStore, NOOP_HARD_LIMIT, …), the legacy path always bailed before
-// reaching the plugin function — the plugin never actually loaded. Exporting a
-// PluginModule record as `default` keeps all named exports intact (the modern
-// path only reads `mod.default`) while satisfying both loaders.
-//
-// Shape: { id: string, server: PluginFunction }
-export default {
-  id: "hashline-edit",
-  server: HashlinePlugin,
-};
-
-// Named export so tests and consumers can reference the function directly.
-export { HashlinePlugin };

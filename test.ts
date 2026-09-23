@@ -27,6 +27,7 @@ import {
   parseGrepOutput,
   type GrepMatch, type GrepFileMatches, type ParsedGrepOutput,
   Tokenizer, Executor, parsePatchStreaming, splitHashlineLines,
+  executeHashlineEdit,
   type Token, type BlockTarget, type ParsedRange, type Anchor,
 } from "./src/index.ts";
 
@@ -2678,6 +2679,66 @@ await (async () => {
     try { rmSync(pyPath); } catch {}
   }
 })();
+
+// ── Test 60: jqr — block spans resolve against tagged snapshot before recovery ─
+console.log("\n─ jqr: block resolution before recovery ─");
+
+{
+  const jqrFile = join(tmpDir, "jqr_mod.py");
+  const snapshotLines = [
+    "def greet(name):",
+    '    msg = "hi"',
+    "    return msg",
+    "",
+    "def bye(name):",
+    '    wave = "bye"',
+    "    return wave",
+  ];
+  const snapshotText = snapshotLines.join("\n");
+  writeFileSync(jqrFile, snapshotText);
+  const canonical = canonicalPath(jqrFile);
+  const tag = snapshotStore.record(canonical, snapshotText);
+
+  // External change: two imports prepended → tag is stale, but the 3-way merge is still viable.
+  const currentLines = ["import os", "import sys", "", ...snapshotLines];
+  writeFileSync(jqrFile, currentLines.join("\n"));
+
+  const patch = `[${jqrFile}#${tag}]
+SWAP.BLK 1:
++def hello():
++    return "hello"
+`;
+  const jqrSections = parsePatch(patch);
+  assertEq(jqrSections.length, 1, "jqr: one section parsed");
+
+  // Control: pre-fix, the raw block-only edit list could not drive the merge (block ops are
+  // no-ops in applyEdits → applied === previousText → tryRecover null → hard mismatch).
+  const rawRecovery = tryRecover(snapshotStore, {
+    path: canonical,
+    currentText: normalizeForStorage(currentLines.join("\n")),
+    fileHash: tag,
+    edits: jqrSections[0]!.edits,
+  });
+  assertEq(rawRecovery, null, "jqr control: raw block edits do not drive the merge (pre-fix path)");
+
+  const result = await executeHashlineEdit({ input: patch }, { sessionID: "jqr-test", worktree: tmpDir, metadata() {} });
+  assert(result.output.includes("Edited ["), "jqr: edit applied despite stale tag (recovered)");
+  const after = readFileSync(jqrFile, "utf-8");
+  assertEq(after, [
+    "import os",
+    "import sys",
+    "",
+    "def hello():",
+    '    return "hello"',
+    "",
+    "def bye(name):",
+    '    wave = "bye"',
+    "    return wave",
+  ].join("\n"), "jqr: block span resolved on snapshot text, merged onto shifted current text");
+  assert(result.output.includes("Recovered from a stale file hash"), "jqr: stale-hash recovery warning surfaced");
+  const freshTag = /#([0-9A-F]{4})\]/.exec(result.output)?.[1];
+  assert(!!freshTag && freshTag !== tag, "jqr: fresh tag minted");
+}
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
